@@ -1,4 +1,4 @@
-# TECO Quant Pro
+# TECO Quant Options Pro
 
 TECO Quant Pro is a local decision-support workspace for analysing Indian index, stock, and commodity options. It collects market data, validates each snapshot, calculates technical and option metrics, ranks CE and PE contracts, estimates position risk, and presents the results in a React dashboard.
 
@@ -35,7 +35,7 @@ The current application does not submit live orders through Dhan Trading APIs. W
 
 ## Calculations
 
-At a high level, TECO Quant Pro calculates:
+At a high level, TECO Quant Options Pro calculates:
 
 - Trend and momentum evidence using completed-candle VWAP, EMA/WMA, Wilder RSI and ATR, plus higher-timeframe confirmation.
 - Option values and Greeks using Black-Scholes for supported spot options and Black-76 for commodity futures options.
