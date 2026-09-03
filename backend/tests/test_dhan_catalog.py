@@ -122,6 +122,26 @@ class DhanCatalogTests(unittest.TestCase):
         self.assertEqual(resolved.option_chain_security_id, "13")
         self.assertEqual(resolved.option_chain_segment, "IDX_I")
 
+    def test_option_contract_spec_allows_a_different_future_tick_size(self) -> None:
+        text = DERIVATIVE_FAMILY_FIXTURE.read_text(encoding="utf-8").replace(
+            "2026-08-28,,,75,0.05",
+            "2026-08-28,,,75,0.10",
+            1,
+        )
+        batch = build_supported_dhan_catalog_batch(
+            text,
+            fetched_at=NOW,
+            source_url="https://example.invalid/master.csv",
+        )
+
+        resolved = DhanInstrumentCatalog(batch).family("NIFTY", as_of=NOW).contract_at(
+            Decimal(24800)
+        )
+
+        self.assertEqual(resolved.contract.tick_size, Decimal("0.05"))
+        assert resolved.contract.futures is not None
+        self.assertEqual(resolved.contract.futures.tick_size, Decimal("0.10"))
+
     def test_derivative_family_alias_bridge_fails_when_index_is_ambiguous(self) -> None:
         text = DERIVATIVE_FAMILY_FIXTURE.read_text(encoding="utf-8").replace(
             "NSE,I,13,NIFTY,Nifty 50,INDEX,INDEX,,,,,,,\n",
@@ -169,6 +189,58 @@ class DhanCatalogTests(unittest.TestCase):
                         resolved.contract.underlying.security_id,
                         expected_ids[symbol][0],
                     )
+
+    def test_current_stock_master_names_resolve_reliance_and_tcs_aliases(self) -> None:
+        csv_text, _ = _all_universe_master()
+        csv_text = csv_text.replace(
+            "NSE,E,700300,RELIANCE,RELIANCE,EQUITY",
+            "NSE,E,700300,RELIANCE INDUSTRIES LTD,Reliance Industries,EQUITY",
+            1,
+        ).replace(
+            "NSE,E,700400,TCS,TCS,EQUITY",
+            (
+                "NSE,E,700400,TATA CONSULTANCY SERVICES LTD,"
+                "Tata Consultancy Services,EQUITY"
+            ),
+            1,
+        )
+        batch = build_supported_dhan_catalog_batch(
+            csv_text,
+            fetched_at=NOW,
+            source_url="https://example.invalid/dhan-master.csv",
+        )
+        catalog = DhanInstrumentCatalog(batch)
+
+        self.assertEqual(
+            catalog.family("RELIANCE", as_of=NOW).underlying.instrument.security_id,
+            "700300",
+        )
+        self.assertEqual(
+            catalog.family("TCS", as_of=NOW).underlying.instrument.security_id,
+            "700400",
+        )
+
+    def test_commodity_family_id_selects_nearest_quoteable_future(self) -> None:
+        batch = build_supported_dhan_catalog_batch(
+            _current_dhan_gold_master(),
+            fetched_at=NOW,
+            source_url="https://example.invalid/dhan-master.csv",
+        )
+
+        resolved = DhanInstrumentCatalog(batch).family("GOLD", as_of=NOW).contract_at(
+            Decimal(118000)
+        )
+
+        assert resolved.contract.futures is not None
+        self.assertEqual(resolved.contract.futures.instrument.security_id, "900001")
+        self.assertEqual(resolved.contract.futures.underlying_security_id, "114")
+        self.assertEqual(resolved.option_chain_security_id, "900001")
+        self.assertTrue(
+            all(
+                option.underlying_security_id == "114"
+                for option in resolved.contract.option_contracts
+            )
+        )
 
     def test_expired_or_incomplete_contracts_fail_closed(self) -> None:
         text = FIXTURE.read_text(encoding="utf-8")
@@ -279,6 +351,28 @@ def _all_universe_master() -> tuple[str, dict[str, tuple[str, str]]]:
                 )
         next_id += 100
     return "\n".join(rows) + "\n", expected
+
+
+def _current_dhan_gold_master() -> str:
+    header = (
+        "EXCH_ID,SEGMENT,SECURITY_ID,SYMBOL_NAME,DISPLAY_NAME,INSTRUMENT,"
+        "INSTRUMENT_TYPE,UNDERLYING_SECURITY_ID,UNDERLYING_SYMBOL,SM_EXPIRY_DATE,"
+        "STRIKE_PRICE,OPTION_TYPE,LOT_SIZE,TICK_SIZE"
+    )
+    rows = [
+        header,
+        "MCX,M,900001,GOLD,GOLD SEP FUT,FUTCOM,FUT,114,GOLD,2026-09-30,0,,1,100",
+        "MCX,M,900002,GOLD,GOLD OCT FUT,FUTCOM,FUT,114,GOLD,2026-10-30,0,,1,100",
+    ]
+    security_id = 900010
+    for strike in (117000, 117500, 118000, 118500, 119000):
+        for side in ("CE", "PE"):
+            rows.append(
+                f"MCX,M,{security_id},GOLD,GOLD 25 SEP {strike} {side},"
+                f"OPTFUT,OP,114,GOLD,2026-09-25,{strike},{side},1,50"
+            )
+            security_id += 1
+    return "\n".join(rows) + "\n"
 
 
 if __name__ == "__main__":

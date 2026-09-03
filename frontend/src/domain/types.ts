@@ -5,6 +5,7 @@ export type ViewId =
   | "dashboard"
   | "calculator"
   | "greeks"
+  | "market_leaders"
   | "ranking"
   | "position_sizer"
   | "trade_plan"
@@ -117,6 +118,9 @@ export interface RankingEntry {
   rank: number;
   side: "CE" | "PE";
   strike: number;
+
+  contractName: string;
+
   score: number;
   band: ScoreBand;
   askEntry: number;

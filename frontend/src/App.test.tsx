@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+﻿import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import App from "./App";
@@ -8,6 +8,12 @@ import { formatNumber } from "./lib/format";
 
 function navigation(): HTMLElement {
   return screen.getByRole("complementary", { name: "Primary navigation" });
+}
+
+async function useDemoWorkspace(
+  user: ReturnType<typeof userEvent.setup>,
+): Promise<void> {
+  await user.click(screen.getByRole("button", { name: "Demo" }));
 }
 
 async function openNiftyCalculator(
@@ -30,9 +36,15 @@ function containingSection(element: HTMLElement): HTMLElement {
 }
 
 describe("Sprint 3 and Sprint 4 application workflows", () => {
-  it("renders the decision workspace with explicit demo and execution locks", () => {
+  it("renders the decision workspace with explicit demo and execution locks", async () => {
+    const user = userEvent.setup();
     render(<App />);
+    await useDemoWorkspace(user);
 
+    expect(
+      screen.getByRole("heading", { name: "Market evidence at a glance." }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Good morning/i)).not.toBeInTheDocument();
     expect(screen.getByText("Live locked")).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -55,6 +67,7 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
   it("keeps market, symbol, and expiry options synchronized", async () => {
     const user = userEvent.setup();
     render(<App />);
+    await useDemoWorkspace(user);
 
     const market = screen.getByLabelText("Market") as HTMLSelectElement;
     const symbol = screen.getByLabelText("Symbol") as HTMLSelectElement;
@@ -94,6 +107,7 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
   it("navigates to the calculator and keeps imported, manual, and effective values separate", async () => {
     const user = userEvent.setup();
     render(<App />);
+    await useDemoWorkspace(user);
     await openNiftyCalculator(user);
 
     expect(
@@ -148,6 +162,7 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
   it("renders exactly five strike rows and ten independently selectable legs", async () => {
     const user = userEvent.setup();
     render(<App />);
+    await useDemoWorkspace(user);
     await openNiftyCalculator(user);
 
     const section = containingSection(
@@ -177,6 +192,7 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
     const best = defaultSnapshot.ranking[0];
     const second = defaultSnapshot.ranking[1];
     render(<App />);
+    await useDemoWorkspace(user);
 
     await user.click(screen.getByRole("button", { name: /Inspect ranking/ }));
     expect(
@@ -185,19 +201,33 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
 
     const bestButton = screen.getByRole("button", { name: /BEST STRIKE/ });
     const secondButton = screen.getByRole("button", { name: /SECOND BEST/ });
-    expect(bestButton).toHaveTextContent(formatNumber(best.strike, 0));
-    expect(bestButton).toHaveTextContent(best.side);
-    expect(secondButton).toHaveTextContent(formatNumber(second.strike, 0));
-    expect(secondButton).toHaveTextContent(second.side);
-
+    expect(bestButton).toHaveTextContent(best.contractName);
+    expect(secondButton).toHaveTextContent(second.contractName);
     const rankingSection = containingSection(
       screen.getByRole("heading", {
         name: `${defaultSnapshot.selection.symbol} strike ranking`,
       }),
     );
-    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(10);
+    const rankingScope = within(rankingSection).getByRole("group", {
+      name: `Ranking scope for ${defaultSnapshot.selection.symbol} ${defaultSnapshot.selection.expiry}`,
+    });
+    const topFiveButton = within(rankingScope).getByRole("button", {
+      name: "Top 5",
+    });
+    const allButton = within(rankingScope).getByRole("button", {
+      name: "All 10",
+    });
+    expect(within(rankingSection).getByText("DEMO snapshot")).toBeInTheDocument();
+    expect(topFiveButton).toHaveAttribute("aria-pressed", "true");
+    expect(allButton).toHaveAttribute("aria-pressed", "false");
+    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(5);
     expect(within(rankingSection).getByText("BEST")).toBeInTheDocument();
     expect(within(rankingSection).getByText("SECOND")).toBeInTheDocument();
+
+    await user.click(allButton);
+    expect(topFiveButton).toHaveAttribute("aria-pressed", "false");
+    expect(allButton).toHaveAttribute("aria-pressed", "true");
+    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(10);
 
     await user.click(secondButton);
     const selectedCard = screen.getByText("INSPECTING").closest("article");
@@ -216,6 +246,7 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
     });
     const selectedRow = defaultSnapshot.chain[4];
     render(<App />);
+    await useDemoWorkspace(user);
     await openNiftyCalculator(user);
 
     await user.click(
@@ -245,3 +276,4 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
     expect(screen.getByText("Per IV-point move")).toBeInTheDocument();
   });
 });
+

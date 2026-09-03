@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -61,11 +61,19 @@ SUPPORTED_UNIVERSE: Mapping[str, UniverseDefinition] = {
         "IDX_I", "BSE_FNO", "INDEX", "FUTIDX", "OPTIDX", PricingModel.BLACK_SCHOLES,
     ),
     "RELIANCE": UniverseDefinition(
-        "RELIANCE", ("RELIANCE",), Exchange.NSE, MarketKind.STOCK,
+        "RELIANCE", (
+            "RELIANCE",
+            "RELIANCE INDUSTRIES",
+            "RELIANCE INDUSTRIES LTD",
+        ), Exchange.NSE, MarketKind.STOCK,
         "NSE_EQ", "NSE_FNO", "EQUITY", "FUTSTK", "OPTSTK", PricingModel.BLACK_SCHOLES,
     ),
     "TCS": UniverseDefinition(
-        "TCS", ("TCS",), Exchange.NSE, MarketKind.STOCK,
+        "TCS", (
+            "TCS",
+            "TATA CONSULTANCY SERVICES",
+            "TATA CONSULTANCY SERVICES LTD",
+        ), Exchange.NSE, MarketKind.STOCK,
         "NSE_EQ", "NSE_FNO", "EQUITY", "FUTSTK", "OPTSTK", PricingModel.BLACK_SCHOLES,
     ),
     "INFY": UniverseDefinition(
@@ -113,16 +121,37 @@ class DhanContractFamily:
         if not pricing_underlying.is_finite() or pricing_underlying <= 0:
             raise DhanCatalogError("pricing underlying must be a positive finite Decimal")
         selected, interval = _select_five_strikes(self.option_records, pricing_underlying)
-        lot_sizes = {record.lot_size for record in (*selected, self.future)}
-        tick_sizes = {record.tick_size for record in (*selected, self.future)}
-        if len(lot_sizes) != 1 or None in lot_sizes or len(tick_sizes) != 1 or None in tick_sizes:
-            raise DhanCatalogError("option and future lot/tick specifications are inconsistent")
+
+        # ContractSpec represents the selected option contract family. The option
+        # legs therefore define its executable lot size and tick size. A covering
+        # futures contract may legitimately have a different tick size and keeps
+        # that specification on its own InstrumentMasterRecord.
+        lot_sizes = {record.lot_size for record in selected}
+        tick_sizes = {record.tick_size for record in selected}
+
+        if len(lot_sizes) != 1 or None in lot_sizes:
+            raise DhanCatalogError(
+                "selected option contracts have inconsistent lot sizes"
+            )
+        if len(tick_sizes) != 1 or None in tick_sizes:
+            raise DhanCatalogError(
+                "selected option contracts have inconsistent tick sizes"
+            )
+
         lot_size = next(iter(lot_sizes))
         tick_size = next(iter(tick_sizes))
         assert lot_size is not None
         assert tick_size is not None
+        # API/workspace selection uses the configured canonical symbol. Dhan's
+        # quoteable equity records can instead expose long legal names (for example,
+        # ``TATA CONSULTANCY SERV LT``). Preserve the verified provider identity and
+        # only canonicalize its presentation/selection symbol.
+        contract_underlying = replace(
+            self.underlying.instrument,
+            symbol=self.definition.symbol,
+        )
         contract = ContractSpec(
-            underlying=self.underlying.instrument,
+            underlying=contract_underlying,
             market_kind=self.definition.market_kind,
             pricing_model=self.definition.pricing_model,
             option_expiry=self.option_expiry,
@@ -272,20 +301,38 @@ class DhanInstrumentCatalog:
         relationship_alias: str | None,
     ) -> DhanContractFamily:
         if definition.market_kind is MarketKind.COMMODITY:
-            future_candidates = self._records(
-                exchange=definition.exchange,
-                segment=definition.derivative_segment,
-                security_id=underlying_id,
-                instrument=definition.future_instrument,
-            )
             future_candidates = tuple(
-                item for item in future_candidates if item[1].expiry is not None and item[1].expiry >= expiry
-            )
-            if len(future_candidates) != 1:
-                raise DhanCatalogError(
-                    f"commodity option {definition.symbol} does not map to one covering future"
+                item
+                for item in self._records(
+                    exchange=definition.exchange,
+                    segment=definition.derivative_segment,
+                    instrument=definition.future_instrument,
                 )
-            normalized_future, future = future_candidates[0]
+                if (
+                    item[1].instrument.security_id == underlying_id
+                    or item[1].underlying_security_id == underlying_id
+                )
+                and _record_name_matches(item[0], definition)
+                and item[1].expiry is not None
+                and item[1].expiry >= expiry
+            )
+            if not future_candidates:
+                raise DhanCatalogError(
+                    f"commodity option {definition.symbol} does not map to a covering future"
+                )
+            nearest_expiry = min(
+                record.expiry
+                for _, record in future_candidates
+                if record.expiry is not None
+            )
+            nearest_futures = tuple(
+                item for item in future_candidates if item[1].expiry == nearest_expiry
+            )
+            if len(nearest_futures) != 1:
+                raise DhanCatalogError(
+                    f"commodity option {definition.symbol} maps ambiguously to its nearest covering future"
+                )
+            normalized_future, future = nearest_futures[0]
             underlying = future
             historical_instrument = normalized_future.instrument or normalized_future.instrument_type
         else:

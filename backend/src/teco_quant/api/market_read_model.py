@@ -431,7 +431,11 @@ class MarketReadModelStore:
     def markets(self, *, now: datetime | None = None) -> JsonObject:
         check_time = self._check_time(now)
         with self._lock:
-            publications = tuple(self._latest.values())
+            publications = tuple(
+                publication
+                for publication in self._latest.values()
+                if publication.snapshot.contract.option_expiry > check_time
+            )
 
         grouped: dict[str, dict[str, list[_PublishedSnapshot]]] = {}
         for publication in publications:

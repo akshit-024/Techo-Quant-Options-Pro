@@ -9,9 +9,12 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from math import isfinite
 from threading import Event, Lock, RLock, Thread, current_thread
+from time import monotonic
 from typing import Any, Protocol
 
+from teco_quant.api.market_leaders import MarketLeaderPublisher
 from teco_quant.api.market_read_model import MarketReadModelStore
 from teco_quant.automation.service import TecoAutomationService
 from teco_quant.brokers.dhan import (
@@ -296,6 +299,18 @@ class _TechnicalCacheEntry:
     result: CompletedTechnicalResult
 
 
+@dataclass(frozen=True, slots=True)
+class _ExpiryCacheEntry:
+    expiries: tuple[date, ...]
+    verified_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedContractCacheEntry:
+    selected: ResolvedDhanContract
+    resolved_at: datetime
+
+
 @dataclass(slots=True)
 class _MarketHealth:
     last_success_at: datetime | None = None
@@ -321,6 +336,7 @@ class DhanAcquisitionService:
         repository: AcquisitionRepository,
         ingestion_service: SnapshotIngestionService,
         read_models: MarketReadModelStore,
+        leader_store: MarketLeaderPublisher | None = None,
         automation_service: TecoAutomationService | None = None,
         signal_service: AutomatedSignalService | None = None,
         context_provider: AcquisitionContextProvider | None = None,
@@ -330,8 +346,11 @@ class DhanAcquisitionService:
         clock: Clock | None = None,
         poll_interval_seconds: float = 10.0,
         maximum_backoff_seconds: float = 60.0,
+        master_refresh_retry_seconds: float = 300.0,
+        expiry_list_cache_grace_seconds: float = 36 * 60 * 60,
         history_days: int = 14,
         maximum_quote_chain_skew_seconds: float = 5.0,
+        resolved_contract_grace_seconds: float = 300.0,
         source_url: str = DHAN_INSTRUMENT_MASTER_DETAILED,
         close_client_on_stop: bool = True,
     ) -> None:
@@ -339,10 +358,28 @@ class DhanAcquisitionService:
             raise ValueError("poll interval cannot be below Dhan's three-second chain limit")
         if maximum_backoff_seconds < poll_interval_seconds:
             raise ValueError("maximum backoff cannot be below the poll interval")
+        if (
+            isinstance(master_refresh_retry_seconds, bool)
+            or not isfinite(float(master_refresh_retry_seconds))
+            or master_refresh_retry_seconds <= 0
+        ):
+            raise ValueError("master refresh retry must be finite and positive")
+        if (
+            isinstance(expiry_list_cache_grace_seconds, bool)
+            or not isfinite(float(expiry_list_cache_grace_seconds))
+            or expiry_list_cache_grace_seconds <= 0
+        ):
+            raise ValueError("expiry-list cache grace must be finite and positive")
         if isinstance(history_days, bool) or not 2 <= history_days <= 90:
             raise ValueError("history_days must be within 2..90")
         if not 0 < maximum_quote_chain_skew_seconds <= 5:
             raise ValueError("quote/chain skew policy must be within (0, 5] seconds")
+        if (
+            isinstance(resolved_contract_grace_seconds, bool)
+            or not isfinite(float(resolved_contract_grace_seconds))
+            or resolved_contract_grace_seconds <= 0
+        ):
+            raise ValueError("resolved-contract grace must be finite and positive")
         selected_symbols = tuple(dict.fromkeys(str(value).strip().upper() for value in symbols))
         if not selected_symbols or any(symbol not in SUPPORTED_UNIVERSE for symbol in selected_symbols):
             raise ValueError("symbols must be a non-empty supported-universe subset")
@@ -353,6 +390,7 @@ class DhanAcquisitionService:
         self._repository = repository
         self._ingestion = ingestion_service
         self._read_models = read_models
+        self._leader_store = leader_store
         self._automation = automation_service
         self._signals = signal_service or AutomatedSignalService()
         self._context_provider = context_provider or FailClosedStrategyInputs()
@@ -363,8 +401,11 @@ class DhanAcquisitionService:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._poll_interval = float(poll_interval_seconds)
         self._maximum_backoff = float(maximum_backoff_seconds)
+        self._master_refresh_retry = float(master_refresh_retry_seconds)
+        self._expiry_list_cache_grace = float(expiry_list_cache_grace_seconds)
         self._history_days = history_days
         self._maximum_quote_chain_skew = float(maximum_quote_chain_skew_seconds)
+        self._resolved_contract_grace = float(resolved_contract_grace_seconds)
         self._source_url = source_url.strip()
         self._close_client_on_stop = close_client_on_stop
 
@@ -375,8 +416,12 @@ class DhanAcquisitionService:
         self._catalog: DhanInstrumentCatalog | None = None
         self._catalog_batch: DhanCatalogBatch | None = None
         self._last_master_refresh: datetime | None = None
+        self._last_master_attempt: datetime | None = None
         self._technical_cache: dict[tuple[str, str], _TechnicalCacheEntry] = {}
-        self._expiry_cache: dict[tuple[str, str, str, date], tuple[date, ...]] = {}
+        self._expiry_cache: dict[
+            tuple[str, str, str, date], _ExpiryCacheEntry
+        ] = {}
+        self._resolved_contracts: dict[str, _ResolvedContractCacheEntry] = {}
         self._subscriptions: tuple[tuple[str, str], ...] = ()
         self._contracts: dict[str, ContractSpec] = {}
         self._registries: dict[str, Mapping[str, str]] = {}
@@ -490,6 +535,7 @@ class DhanAcquisitionService:
                     None if self._catalog is None else self._catalog.provenance.batch_id
                 ),
                 "last_master_refresh": _iso(self._last_master_refresh),
+                "last_master_attempt": _iso(self._last_master_attempt),
                 "last_cycle_started_at": _iso(self._last_cycle_started),
                 "last_cycle_completed_at": _iso(self._last_cycle_completed),
                 "last_success_at": _iso(self._last_success),
@@ -528,7 +574,11 @@ class DhanAcquisitionService:
     def _run_once_locked(self, started: datetime) -> AcquisitionCycleResult:
         with self._lock:
             self._last_cycle_started = started
-            if self._client is not None:
+            # INITIALIZING describes startup, not every refresh. A full sweep can
+            # legitimately take longer than the nominal poll interval because Dhan's
+            # option-chain requests are globally throttled. Preserve the last completed
+            # RUNNING/PARTIAL/ERROR state while that next generation is in flight.
+            if self._client is not None and self._last_cycle is None:
                 self._lifecycle = AcquisitionLifecycle.INITIALIZING
         if self._client is None:
             results = tuple(
@@ -586,35 +636,55 @@ class DhanAcquisitionService:
             except Exception as exc:  # noqa: BLE001 - one symbol must not block others
                 preflight_failures[symbol] = self._failure(symbol, exc, started)
 
-        technicals_by_symbol: dict[str, CompletedTechnicalResult] = {}
-        for symbol, family in tuple(families.items()):
-            try:
-                technicals_by_symbol[symbol] = self._technicals_for(
-                    segment=family.underlying.instrument.segment,
-                    security_id=family.underlying.instrument.security_id,
-                    instrument=family.historical_instrument,
-                    now=self._checked_time(self._clock()),
-                )
-            except Exception as exc:  # noqa: BLE001 - one symbol must not block others
-                preflight_failures[symbol] = self._failure(symbol, exc, started)
-                families.pop(symbol, None)
-
         quote_payload: Mapping[str, Any] | None = None
         quote_received_at: datetime | None = None
-        if families:
-            request: dict[str, list[str]] = {}
-            for family in families.values():
-                for record in (family.underlying, family.future):
-                    request.setdefault(record.instrument.segment, []).append(
-                        record.instrument.security_id
-                    )
-            request = {
-                segment: list(dict.fromkeys(security_ids))
-                for segment, security_ids in request.items()
-            }
+        request: dict[str, list[str]] = {}
+        for family in families.values():
+            for record in (family.underlying, family.future):
+                request.setdefault(record.instrument.segment, []).append(
+                    record.instrument.security_id
+                )
+        if self._leader_store is not None:
+            try:
+                for segment, security_ids in self._leader_store.quote_request().items():
+                    request.setdefault(segment, []).extend(security_ids)
+            except Exception as exc:  # noqa: BLE001 - independent read-model boundary
+                _LOGGER.warning(
+                    "market_leaders %s",
+                    json.dumps(
+                        {
+                            "error_code": _error_code(exc),
+                            "event": "quote_request_unavailable",
+                        },
+                        sort_keys=True,
+                    ),
+                )
+        request = {
+            segment: list(dict.fromkeys(security_ids))
+            for segment, security_ids in request.items()
+            if security_ids
+        }
+        if request:
             try:
                 quote_payload = self._client.market_quote(request)
                 quote_received_at = self._checked_time(self._clock())
+                if self._leader_store is not None:
+                    try:
+                        self._leader_store.publish_dhan_quote(
+                            quote_payload,
+                            received_at=quote_received_at,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - independent read model
+                        _LOGGER.warning(
+                            "market_leaders %s",
+                            json.dumps(
+                                {
+                                    "error_code": _error_code(exc),
+                                    "event": "quote_publish_failed",
+                                },
+                                sort_keys=True,
+                            ),
+                        )
             except Exception as exc:  # noqa: BLE001 - provider boundary is isolated
                 for symbol in families:
                     preflight_failures[symbol] = self._failure(symbol, exc, started)
@@ -642,13 +712,22 @@ class DhanAcquisitionService:
                 except Exception as exc:  # noqa: BLE001 - one symbol must not block others
                     preflight_failures[symbol] = self._failure(symbol, exc, started)
 
-        self._publish_contract_callbacks(resolved)
+        self._publish_contract_callbacks(
+            resolved,
+            now=self._checked_time(self._clock()),
+        )
         results_by_symbol = dict(preflight_failures)
         for symbol, selected in resolved.items():
             assert quote_payload is not None
             assert quote_received_at is not None
             family = families[symbol]
             try:
+                technicals = self._technicals_for(
+                    segment=family.underlying.instrument.segment,
+                    security_id=family.underlying.instrument.security_id,
+                    instrument=family.historical_instrument,
+                    now=self._checked_time(self._clock()),
+                )
                 results_by_symbol[symbol] = self._acquire_market(
                     selected,
                     underlying_quote=self._quote(
@@ -657,7 +736,7 @@ class DhanAcquisitionService:
                     future_quote=self._quote(
                         quote_payload, family.future, quote_received_at, quotes
                     ),
-                    technicals=technicals_by_symbol[symbol],
+                    technicals=technicals,
                 )
             except Exception as exc:  # noqa: BLE001 - one symbol must not block others
                 results_by_symbol[symbol] = self._failure(symbol, exc, started)
@@ -681,6 +760,9 @@ class DhanAcquisitionService:
 
     def _refresh_master(self) -> None:
         assert self._client is not None
+        attempted_at = self._checked_time(self._clock())
+        with self._lock:
+            self._last_master_attempt = attempted_at
         csv_text = self._client.instrument_master(detailed=True)
         fetched_at = self._checked_time(self._clock())
         batch = build_supported_dhan_catalog_batch(
@@ -689,13 +771,44 @@ class DhanAcquisitionService:
             source_url=self._source_url,
         )
         self._repository.record_instrument_master(batch.provenance, batch.records)
+        if self._leader_store is not None:
+            try:
+                # The leader scanner needs the complete provider master, while the
+                # contract catalog deliberately persists only its supported subset.
+                self._leader_store.replace_instrument_master(
+                    csv_text,
+                    as_of=fetched_at,
+                )
+            except Exception as exc:  # noqa: BLE001 - independent read-model boundary
+                # A scanner-catalog problem must not discard a valid option catalog.
+                # Its previously accepted observations naturally age to STALE.
+                _LOGGER.warning(
+                    "market_leaders %s",
+                    json.dumps(
+                        {
+                            "error_code": _error_code(exc),
+                            "event": "instrument_master_refresh_failed",
+                        },
+                        sort_keys=True,
+                    ),
+                )
         catalog = DhanInstrumentCatalog(batch)
         with self._lock:
             self._catalog_batch = batch
             self._catalog = catalog
             self._last_master_refresh = fetched_at
             self._master_error_code = None
-            self._expiry_cache.clear()
+            # Expiry-list responses are provider-verified independently of the
+            # instrument-master batch. Keep a bounded prior response across the daily
+            # batch/date rollover so a transient expiry endpoint error does not halt a
+            # still-valid contract; catalog expiry and identity checks remain mandatory.
+            self._expiry_cache = {
+                key: entry
+                for key, entry in self._expiry_cache.items()
+                if -5.0
+                <= (fetched_at - entry.verified_at).total_seconds()
+                <= self._expiry_list_cache_grace
+            }
         _LOGGER.info(
             "market_master %s",
             json.dumps(
@@ -726,23 +839,68 @@ class DhanAcquisitionService:
             now.astimezone(IST).date(),
         )
         with self._lock:
-            expiry_dates = self._expiry_cache.get(cache_key)
+            cached = self._expiry_cache.get(cache_key)
+        expiry_dates = (
+            None
+            if cached is None
+            or (now - cached.verified_at).total_seconds()
+            > self._expiry_list_cache_grace
+            else cached.expiries
+        )
         if expiry_dates is None:
-            values = self._client.expiry_list(
-                underlying_security_id=int(tentative.option_chain_security_id),
-                underlying_segment=tentative.option_chain_segment,
-            )
-            parsed: list[date] = []
-            for value in values:
-                try:
-                    parsed.append(date.fromisoformat(value.strip()[:10]))
-                except (AttributeError, ValueError) as exc:
-                    raise ValueError("Dhan expiry list contains a non-ISO date") from exc
-            expiry_dates = tuple(sorted(set(parsed)))
-            if not expiry_dates:
-                raise ValueError("Dhan expiry list is empty")
-            with self._lock:
-                self._expiry_cache[cache_key] = expiry_dates
+            try:
+                values = self._client.expiry_list(
+                    underlying_security_id=int(tentative.option_chain_security_id),
+                    underlying_segment=tentative.option_chain_segment,
+                )
+                parsed: list[date] = []
+                for value in values:
+                    try:
+                        parsed.append(date.fromisoformat(value.strip()[:10]))
+                    except (AttributeError, ValueError) as exc:
+                        raise ValueError(
+                            "Dhan expiry list contains a non-ISO date"
+                        ) from exc
+                expiry_dates = tuple(sorted(set(parsed)))
+                if not expiry_dates:
+                    raise ValueError("Dhan expiry list is empty")
+                with self._lock:
+                    self._expiry_cache[cache_key] = _ExpiryCacheEntry(
+                        expiries=expiry_dates,
+                        verified_at=now,
+                    )
+            except Exception as exc:
+                # A daily master refresh changes the cache key even when the quoted
+                # underlying identity is unchanged. Reuse the newest bounded,
+                # provider-verified list for that exact identity; the fresh catalog
+                # still has to prove a non-expired contract from the intersection.
+                with self._lock:
+                    fallbacks = tuple(
+                        entry
+                        for key, entry in self._expiry_cache.items()
+                        if key[1] == tentative.option_chain_segment
+                        and key[2] == tentative.option_chain_security_id
+                        and -5.0
+                        <= (now - entry.verified_at).total_seconds()
+                        <= self._expiry_list_cache_grace
+                    )
+                if not fallbacks:
+                    raise
+                fallback = max(fallbacks, key=lambda entry: entry.verified_at)
+                expiry_dates = fallback.expiries
+                _LOGGER.warning(
+                    "market_expiry %s",
+                    json.dumps(
+                        {
+                            "error_code": _error_code(exc),
+                            "event": "verified_expiry_cache_fallback",
+                            "symbol": symbol,
+                            "verified_at": fallback.verified_at.isoformat(),
+                        },
+                        sort_keys=True,
+                    ),
+                )
+        assert expiry_dates is not None
         return catalog.family(
             symbol,
             as_of=now,
@@ -753,9 +911,17 @@ class DhanAcquisitionService:
         with self._lock:
             previous = self._last_master_refresh
             catalog_missing = self._catalog is None
-        return catalog_missing or previous is None or (
-            previous.astimezone(IST).date() != now.astimezone(IST).date()
-        )
+            previous_attempt = self._last_master_attempt
+        if catalog_missing or previous is None:
+            # With no last-good master, the worker's normal failure backoff owns retry
+            # cadence; there is no useful acquisition work to protect from the fetch.
+            return True
+        if previous.astimezone(IST).date() == now.astimezone(IST).date():
+            return False
+        if previous_attempt is None:
+            return True
+        attempt_age = (now - previous_attempt).total_seconds()
+        return attempt_age < 0 or attempt_age >= self._master_refresh_retry
 
     def _acquire_market(
         self,
@@ -1030,42 +1196,62 @@ class DhanAcquisitionService:
         return cache[key]
 
     def _publish_contract_callbacks(
-        self, resolved: Mapping[str, ResolvedDhanContract]
+        self,
+        resolved: Mapping[str, ResolvedDhanContract],
+        *,
+        now: datetime,
     ) -> None:
-        subscriptions = _unique_subscriptions(
-            item for selected in resolved.values() for item in selected.subscriptions
-        )
-        contracts = {symbol: selected.contract for symbol, selected in resolved.items()}
-        registries = {
-            symbol: selected.execution_registry for symbol, selected in resolved.items()
-        }
+        check_time = self._checked_time(now)
         with self._lock:
-            if len(resolved) == len(self._symbols):
-                selected_subscriptions = subscriptions
-                selected_contracts = contracts
-                selected_registries = registries
-                self._subscriptions = selected_subscriptions
-                self._contracts = selected_contracts
-                self._registries = selected_registries
-            else:
-                # A partial resolution may contain a new contract for one symbol
-                # while another symbol still points at an older/expired family.
-                # Keep the last complete registry as one coherent generation;
-                # before the first complete generation this deliberately stays
-                # empty rather than exposing a misleading partial universe.
-                selected_subscriptions = self._subscriptions
-                selected_contracts = dict(self._contracts)
-                selected_registries = dict(self._registries)
+            # Each symbol owns its own verified generation. A successful resolution
+            # can therefore start or rotate its subscriptions without waiting for all
+            # other configured markets. Short provider failures retain the last proven
+            # family, but expired or long-unresolved entries are removed so an inactive
+            # leg cannot poison WebSocket readiness indefinitely.
+            had_generation = bool(self._subscriptions or self._contracts)
+            updated = dict(self._resolved_contracts)
+            for symbol, selected in resolved.items():
+                updated[symbol] = _ResolvedContractCacheEntry(
+                    selected=selected,
+                    resolved_at=check_time,
+                )
+            active = {
+                symbol: updated[symbol]
+                for symbol in self._symbols
+                if symbol in updated
+                and _resolved_entry_active(
+                    updated[symbol],
+                    now=check_time,
+                    maximum_age_seconds=self._resolved_contract_grace,
+                )
+            }
+            self._resolved_contracts = active
+            selected_subscriptions = _unique_subscriptions(
+                item
+                for entry in active.values()
+                for item in entry.selected.subscriptions
+            )
+            selected_contracts = {
+                symbol: entry.selected.contract for symbol, entry in active.items()
+            }
+            selected_registries = {
+                symbol: entry.selected.execution_registry
+                for symbol, entry in active.items()
+            }
+            self._subscriptions = selected_subscriptions
+            self._contracts = selected_contracts
+            self._registries = selected_registries
 
         callback_error_code: str | None = None
         callback_attempted = False
-        if self._on_subscriptions is not None:
+        generation_available = bool(selected_subscriptions) or had_generation
+        if self._on_subscriptions is not None and generation_available:
             callback_attempted = True
             try:
                 self._on_subscriptions(selected_subscriptions)
             except Exception as exc:  # noqa: BLE001 - injected callback boundary
                 callback_error_code = _error_code(exc)
-        if self._on_contracts is not None:
+        if self._on_contracts is not None and generation_available:
             callback_attempted = True
             try:
                 self._on_contracts(dict(selected_contracts), dict(selected_registries))
@@ -1075,8 +1261,8 @@ class DhanAcquisitionService:
             if callback_error_code is not None:
                 self._callback_error_code = callback_error_code
             elif callback_attempted:
-                # Clear a prior delivery error only after a complete callback
-                # reconciliation attempt has actually succeeded.
+                # Clear a prior delivery error only after the current partial or
+                # complete generation has actually reconciled successfully.
                 self._callback_error_code = None
 
     def _failure(
@@ -1146,22 +1332,41 @@ class DhanAcquisitionService:
 
     def _worker(self) -> None:
         while not self._stop_event.is_set():
+            cycle_started = monotonic()
             try:
                 cycle = self.run_once()
                 failed = cycle.data_successful_markets == 0
-            except Exception:  # noqa: BLE001 - daemon supervisor must remain bounded
+            except Exception as exc:  # noqa: BLE001 - daemon supervisor remains bounded
                 failed = True
                 with self._lock:
                     self._lifecycle = AcquisitionLifecycle.ERROR
                     self._consecutive_failures += 1
+                _LOGGER.warning(
+                    "market_cycle %s",
+                    json.dumps(
+                        {
+                            "error_code": _error_code(exc),
+                            "event": "acquisition_cycle_failed",
+                            "state": AcquisitionLifecycle.ERROR.value,
+                        },
+                        sort_keys=True,
+                    ),
+                )
             with self._lock:
                 failures = self._consecutive_failures
-            delay = self._poll_interval
             if failed:
+                # A failed provider sweep receives a real post-failure pause. This
+                # prevents a long failed request from immediately hammering Dhan again.
                 delay = min(
                     self._maximum_backoff,
                     self._poll_interval * (2 ** min(max(0, failures - 1), 6)),
                 )
+            else:
+                # Successful sweeps are scheduled from their start time. With multiple
+                # symbols, endpoint rate limiting can consume the whole interval; adding
+                # another unconditional sleep would let early snapshots become stale.
+                elapsed = max(0.0, monotonic() - cycle_started)
+                delay = max(0.0, self._poll_interval - elapsed)
             self._stop_event.wait(delay)
 
     @staticmethod
@@ -1202,6 +1407,24 @@ def _unique_subscriptions(
             seen.add(selected)
             result.append(selected)
     return tuple(result)
+
+
+def _resolved_entry_active(
+    entry: _ResolvedContractCacheEntry,
+    *,
+    now: datetime,
+    maximum_age_seconds: float,
+) -> bool:
+    selected = entry.selected
+    future = selected.contract.futures
+    age = (now - entry.resolved_at).total_seconds()
+    return bool(
+        -5.0 <= age <= maximum_age_seconds
+        and selected.contract.option_expiry > now
+        and future is not None
+        and future.expiry is not None
+        and future.expiry > now
+    )
 
 
 def _error_code(error: BaseException) -> str:

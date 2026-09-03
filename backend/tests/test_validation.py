@@ -27,6 +27,88 @@ class SnapshotValidationTests(unittest.TestCase):
         self.assertEqual(report.snapshot_id, snapshot.snapshot_id)
         self.assertEqual(len(report.snapshot_hash or ""), 64)
 
+    def test_index_derivative_family_and_distinct_future_tick_are_accepted(self) -> None:
+        snapshot = valid_snapshot()
+        assert snapshot.contract.futures is not None
+        contract = replace(
+            snapshot.contract,
+            futures=replace(
+                snapshot.contract.futures,
+                underlying_security_id="26000",
+                tick_size=Decimal("0.10"),
+            ),
+            option_contracts=tuple(
+                replace(record, underlying_security_id="26000")
+                for record in snapshot.contract.option_contracts
+            ),
+        )
+
+        report = self.validator.validate(replace(snapshot, contract=contract))
+
+        self.assertTrue(report.accepted, report.issues)
+
+    def test_distinct_future_lot_size_remains_rejected(self) -> None:
+        snapshot = valid_snapshot()
+        assert snapshot.contract.futures is not None
+        contract = replace(
+            snapshot.contract,
+            futures=replace(
+                snapshot.contract.futures,
+                lot_size=snapshot.contract.lot_size + 1,
+            ),
+        )
+
+        report = self.validator.validate(replace(snapshot, contract=contract))
+
+        self.assertFalse(report.accepted)
+        self.assertTrue(report.has_code("FUTURES_MASTER_SPEC_MISMATCH"), report.issues)
+
+    def test_index_future_must_match_the_option_derivative_family(self) -> None:
+        snapshot = valid_snapshot()
+        assert snapshot.contract.futures is not None
+        contract = replace(
+            snapshot.contract,
+            futures=replace(
+                snapshot.contract.futures,
+                underlying_security_id="26009",
+            ),
+            option_contracts=tuple(
+                replace(record, underlying_security_id="26000")
+                for record in snapshot.contract.option_contracts
+            ),
+        )
+
+        report = self.validator.validate(replace(snapshot, contract=contract))
+
+        self.assertFalse(report.accepted)
+        self.assertTrue(report.has_code("FUTURES_UNDERLYING_MISMATCH"), report.issues)
+
+    def test_index_options_must_share_one_derivative_family_id(self) -> None:
+        snapshot = valid_snapshot()
+        assert snapshot.contract.futures is not None
+        option_contracts = tuple(
+            replace(record, underlying_security_id="26000")
+            for record in snapshot.contract.option_contracts
+        )
+        option_contracts = (
+            replace(option_contracts[0], underlying_security_id="26009"),
+            *option_contracts[1:],
+        )
+        contract = replace(
+            snapshot.contract,
+            futures=replace(
+                snapshot.contract.futures,
+                underlying_security_id="26000",
+            ),
+            option_contracts=option_contracts,
+        )
+
+        report = self.validator.validate(replace(snapshot, contract=contract))
+
+        self.assertFalse(report.accepted)
+        self.assertTrue(report.has_code("OPTION_MASTER_IDENTITY_MISMATCH"), report.issues)
+        self.assertTrue(report.has_code("FUTURES_UNDERLYING_MISMATCH"), report.issues)
+
     def test_missing_leg_price_rejects_snapshot(self) -> None:
         snapshot = valid_snapshot()
         broken = replace(snapshot.option_chain[0], bid=None)
@@ -207,23 +289,33 @@ class SnapshotValidationTests(unittest.TestCase):
     def test_valid_mcx_contract_uses_exact_future_and_black_76(self) -> None:
         snapshot = valid_snapshot()
         option_expiry = NOW + timedelta(days=7)
+
+        # Mirrors Dhan's real MCX derivative-family relationship:
+        # the quoteable futures security ID is distinct from the
+        # derivative-family underlying_security_id used by both
+        # the future master row and its option master rows.
+        derivative_family_id = "294"
+
         future_instrument = InstrumentId(
             exchange=Exchange.MCX,
             segment="MCX_COMM",
             security_id="70001",
             symbol="CRUDEOIL-AUG-FUT",
         )
+
         future = InstrumentMasterRecord(
             instrument=future_instrument,
             display_name="CRUDE OIL AUG FUT",
             instrument_type="FUTCOM",
-            underlying_security_id="CRUDEOIL",
+            underlying_security_id=derivative_family_id,
             expiry=NOW + timedelta(days=8),
             lot_size=100,
             tick_size=Decimal("0.10"),
         )
+
         records: list[InstrumentMasterRecord] = []
         quotes = []
+
         for index, strike in enumerate(
             (
                 Decimal(6900),
@@ -233,8 +325,11 @@ class SnapshotValidationTests(unittest.TestCase):
                 Decimal(7100),
             )
         ):
-            for side_index, option_type in enumerate((OptionType.CALL, OptionType.PUT)):
+            for side_index, option_type in enumerate(
+                (OptionType.CALL, OptionType.PUT)
+            ):
                 security_id = str(80000 + index * 2 + side_index)
+
                 records.append(
                     InstrumentMasterRecord(
                         instrument=InstrumentId(
@@ -245,7 +340,7 @@ class SnapshotValidationTests(unittest.TestCase):
                         ),
                         display_name=f"CRUDE OIL {strike} {option_type.value}",
                         instrument_type="OPTFUT",
-                        underlying_security_id=future_instrument.security_id,
+                        underlying_security_id=derivative_family_id,
                         expiry=option_expiry,
                         strike=strike,
                         option_type=option_type,
@@ -253,6 +348,7 @@ class SnapshotValidationTests(unittest.TestCase):
                         tick_size=Decimal("0.10"),
                     )
                 )
+
                 source_quote = snapshot.option_chain[index * 2 + side_index]
                 quotes.append(
                     replace(
@@ -262,6 +358,7 @@ class SnapshotValidationTests(unittest.TestCase):
                         expiry=option_expiry,
                     )
                 )
+
         contract = ContractSpec(
             underlying=future_instrument,
             market_kind=MarketKind.COMMODITY,
@@ -279,6 +376,7 @@ class SnapshotValidationTests(unittest.TestCase):
             option_contracts=tuple(records),
             futures=future,
         )
+
         candidate = replace(
             snapshot,
             contract=contract,

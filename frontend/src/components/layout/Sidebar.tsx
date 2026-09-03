@@ -17,6 +17,7 @@ const primaryItems: readonly { id: ViewId; label: string; icon: IconName }[] = [
 ];
 
 const engineItems: readonly { id: ViewId; label: string; icon: IconName }[] = [
+  { id: "market_leaders", label: "Market leaders", icon: "activity" },
   { id: "greeks", label: "Greeks engine", icon: "greeks" },
   { id: "ranking", label: "Strike ranking", icon: "ranking" },
 ];

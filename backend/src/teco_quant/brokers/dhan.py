@@ -129,8 +129,10 @@ class DhanRestClient:
         return self._json_request("GET", "/profile")
 
     def expiry_list(self, *, underlying_security_id: int, underlying_segment: str) -> list[str]:
-        key = f"expiry:{underlying_segment}:{underlying_security_id}"
-        self._option_chain_limiter.wait(key)
+        # Dhan applies the documented option-chain cadence at the API family,
+        # not independently for each underlying. A payload-specific key allowed a
+        # nine-symbol refresh to burst requests and then fall into provider 429s.
+        self._option_chain_limiter.wait("option_chain_api")
         payload = {
             "UnderlyingScrip": underlying_security_id,
             "UnderlyingSeg": underlying_segment,
@@ -148,8 +150,7 @@ class DhanRestClient:
         underlying_segment: str,
         expiry: date,
     ) -> Mapping[str, Any]:
-        key = f"chain:{underlying_segment}:{underlying_security_id}:{expiry.isoformat()}"
-        self._option_chain_limiter.wait(key)
+        self._option_chain_limiter.wait("option_chain_api")
         payload = {
             "UnderlyingScrip": underlying_security_id,
             "UnderlyingSeg": underlying_segment,
@@ -230,9 +231,9 @@ class DhanRestClient:
             "fromDate": from_datetime.astimezone(_IST).strftime("%Y-%m-%d %H:%M:%S"),
             "toDate": to_datetime.astimezone(_IST).strftime("%Y-%m-%d %H:%M:%S"),
         }
-        self._historical_limiter.wait(
-            f"intraday:{selected_segment}:{selected_security_id}:{interval}"
-        )
+        # Historical calls share one endpoint budget. Per-instrument buckets can
+        # otherwise issue the entire configured universe in one burst.
+        self._historical_limiter.wait("intraday_api")
         response = self._json_request("POST", "/charts/intraday", payload)
         data = response.get("data", response)
         if not isinstance(data, Mapping):

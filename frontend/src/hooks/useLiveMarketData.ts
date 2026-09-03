@@ -109,9 +109,9 @@ export function useLiveMarketData(
         selected !== null && selectionsEqual(current.workspace?.selection ?? null, selected);
       return {
         ...current,
-        connection: "LOADING",
+        connection: keepWorkspace ? current.connection : "LOADING",
         workspace: keepWorkspace ? current.workspace : null,
-        stale: keepWorkspace,
+        stale: keepWorkspace ? current.stale : false,
         isLoading: true,
         error: null,
       };
@@ -143,7 +143,28 @@ export function useLiveMarketData(
   ]);
 
   const requestRefresh = useCallback(() => refresh(), []);
-  return { ...state, refresh: requestRefresh };
+  const currentSelection =
+    marketId === null || symbol === null || expiry === null
+      ? null
+      : { market_id: marketId, symbol, expiry };
+  const visibleWorkspace = selectionsEqual(
+    state.workspace?.selection ?? null,
+    currentSelection,
+  )
+    ? state.workspace
+    : null;
+  const hidingObsoleteWorkspace =
+    state.workspace !== null && visibleWorkspace === null;
+
+  return {
+    ...state,
+    connection: hidingObsoleteWorkspace ? "LOADING" : state.connection,
+    workspace: visibleWorkspace,
+    isLoading: hidingObsoleteWorkspace || state.isLoading,
+    stale: hidingObsoleteWorkspace ? false : state.stale,
+    error: hidingObsoleteWorkspace ? null : state.error,
+    refresh: requestRefresh,
+  };
 }
 
 interface MarketLoopArguments {
@@ -169,116 +190,118 @@ async function runMarketLoop({
 }: MarketLoopArguments): Promise<void> {
   const request = { baseUrl, signal: controller.signal, requestTimeoutMs, fetchImpl };
   let revision = 0;
-  try {
-    // Status is intentionally fetched first: missing Dhan credentials should not be
-    // misreported as an empty market catalog.
-    const status = await fetchBackendStatus({
-      baseUrl,
-      signal: controller.signal,
-      timeoutMs: requestTimeoutMs,
-      fetchImpl,
-    });
-    if (controller.signal.aborted) return;
-    revision = status.market_data?.revision ?? 0;
-    if (status.market_data?.feed.state === "CONFIG_REQUIRED") {
-      setState((current) => ({
-        ...current,
-        connection: "CONFIG_REQUIRED",
-        isLoading: false,
-        stale: current.workspace !== null,
-        error: "Dhan credentials are required before live market data can start.",
-        revision,
-      }));
-      return;
-    }
+  while (!controller.signal.aborted) {
+    try {
+      // Refresh status and catalog on every bounded cycle. A backend can begin with
+      // no published workspaces and recover later, and expiries can roll while the
+      // browser remains open. Neither condition is terminal.
+      const status = await fetchBackendStatus({
+        baseUrl,
+        signal: controller.signal,
+        timeoutMs: requestTimeoutMs,
+        fetchImpl,
+      });
+      if (controller.signal.aborted) return;
+      revision = Math.max(revision, status.market_data?.revision ?? 0);
 
-    const catalog = await fetchMarketCatalog({
-      baseUrl,
-      signal: controller.signal,
-      timeoutMs: requestTimeoutMs,
-      fetchImpl,
-    });
-    if (controller.signal.aborted) return;
-    if (catalog.markets.length === 0) {
-      setState((current) => ({
-        ...current,
-        connection: "EMPTY",
-        catalog,
-        isLoading: false,
-        stale: current.workspace !== null,
-        error: null,
-        revision,
-      }));
-      return;
-    }
-    // Publish choices before resolving the workspace. This lets the caller repair an
-    // expired startup selection even when the selected lookup would return 404.
-    setState((current) => ({ ...current, catalog, revision }));
-    if (selection === null) {
-      setState((current) => ({
-        ...current,
-        connection: "LIVE",
-        catalog,
-        workspace: null,
-        isLoading: false,
-        stale: false,
-        error: null,
-        revision,
-      }));
-      return;
-    }
-    if (!catalogContainsSelection(catalog, selection)) {
-      setState((current) => ({
-        ...current,
-        connection: "ERROR",
-        catalog,
-        workspace: null,
-        isLoading: false,
-        stale: false,
-        error: "The selected market contract is not available in the current catalog.",
-        revision,
-      }));
-      return;
-    }
-
-    let workspace = await loadWorkspace({ ...request, selection });
-    if (controller.signal.aborted) return;
-    publishSuccess(setState, catalog, workspace, revision);
-
-    while (!controller.signal.aborted) {
-      try {
-        const update = await waitForMarketUpdates({
-          baseUrl,
-          signal: controller.signal,
-          fetchImpl,
-          after: revision,
-          timeoutSeconds: updateTimeoutSeconds,
-          timeoutMs: (updateTimeoutSeconds + 5) * 1_000,
-        });
-        if (controller.signal.aborted) return;
-        revision = update.revision;
-        const relevantWorkspace =
-          update.reset_required ||
-          !update.changed ||
-          (update.event?.event_type === "WORKSPACE" &&
-            eventMatchesSelection(update.event, selection));
-        if (relevantWorkspace) {
-          workspace = await loadWorkspace({ ...request, selection });
-          if (controller.signal.aborted) return;
-          publishSuccess(setState, catalog, workspace, revision);
-        } else {
-          setState((current) => ({ ...current, revision }));
-          await abortableDelay(Math.min(retryDelayMs, 1_000), controller.signal);
-        }
-      } catch (error) {
-        if (controller.signal.aborted || isCancelled(error)) return;
-        publishFailure(setState, error);
+      if (status.market_data?.feed.state === "CONFIG_REQUIRED") {
+        setState((current) => ({
+          ...current,
+          connection: "CONFIG_REQUIRED",
+          isLoading: false,
+          stale: current.workspace !== null,
+          error: "Dhan credentials are required before live market data can start.",
+          revision,
+        }));
         await abortableDelay(retryDelayMs, controller.signal);
+        continue;
       }
+
+      const catalog = await fetchMarketCatalog({
+        baseUrl,
+        signal: controller.signal,
+        timeoutMs: requestTimeoutMs,
+        fetchImpl,
+      });
+      if (controller.signal.aborted) return;
+
+      // Publish discovery independently of workspace resolution so App can adopt a
+      // newly rolled expiry. A partial catalog must never terminate the refresh loop.
+      setState((current) => ({ ...current, catalog, revision }));
+
+      if (catalog.markets.length === 0) {
+        setState((current) => ({
+          ...current,
+          connection: current.workspace === null ? "EMPTY" : "STALE",
+          catalog,
+          isLoading: false,
+          stale: current.workspace !== null,
+          error: "The backend has not published any validated market workspace yet.",
+          revision,
+        }));
+        await abortableDelay(retryDelayMs, controller.signal);
+        continue;
+      }
+
+      if (selection === null) {
+        setState((current) => ({
+          ...current,
+          connection: "LIVE",
+          catalog,
+          workspace: null,
+          isLoading: false,
+          stale: false,
+          error: null,
+          revision,
+        }));
+      } else if (!catalogContainsSelection(catalog, selection)) {
+        setState((current) => ({
+          ...current,
+          connection: current.workspace === null ? "EMPTY" : "STALE",
+          catalog,
+          isLoading: false,
+          stale: current.workspace !== null,
+          error: `${selection.symbol} ${selection.expiry.slice(0, 10)} has not published a validated workspace yet.`,
+          revision,
+        }));
+        await abortableDelay(retryDelayMs, controller.signal);
+        continue;
+      } else {
+        const workspace = await loadWorkspace({ ...request, selection });
+        if (controller.signal.aborted) return;
+        if (!selectionsEqual(workspace.selection, selection)) {
+          throw new BackendApiError(
+            "INVALID_RESPONSE",
+            "The backend returned a workspace for a different market selection.",
+            { route: "/market/workspace" },
+          );
+        }
+        publishSuccess(setState, catalog, workspace, revision);
+      }
+
+      // A bounded long poll avoids aggressive REST polling. On an event or timeout,
+      // loop through status/catalog/workspace again so freshness and rollovers are
+      // re-evaluated even when no selected-workspace event was emitted.
+      const update = await waitForMarketUpdates({
+        baseUrl,
+        signal: controller.signal,
+        fetchImpl,
+        after: revision,
+        timeoutSeconds: updateTimeoutSeconds,
+        timeoutMs: (updateTimeoutSeconds + 5) * 1_000,
+      });
+      if (controller.signal.aborted) return;
+      revision = Math.max(revision, update.revision);
+      setState((current) => ({ ...current, revision }));
+      // Feed ticks can advance the global revision continuously. Bound local
+      // workspace reads so they cannot spin while still guaranteeing that a
+      // coalesced WORKSPACE publication is observed promptly.
+      await abortableDelay(Math.min(retryDelayMs, 1_000), controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted || isCancelled(error)) return;
+      publishFailure(setState, error, revision);
+      await abortableDelay(retryDelayMs, controller.signal);
     }
-  } catch (error) {
-    if (controller.signal.aborted || isCancelled(error)) return;
-    publishFailure(setState, error, revision);
   }
 }
 
@@ -391,17 +414,6 @@ function selectionsEqual(
     left.market_id === right.market_id &&
     left.symbol === right.symbol &&
     left.expiry === right.expiry
-  );
-}
-
-function eventMatchesSelection(
-  event: { market_id: string | null; symbol: string | null; expiry: string | null },
-  selection: MarketSelection,
-): boolean {
-  return (
-    event.market_id === selection.market_id &&
-    event.symbol === selection.symbol &&
-    event.expiry === selection.expiry
   );
 }
 

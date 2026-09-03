@@ -56,6 +56,10 @@ class LiveFeedRuntime(Protocol):
         self, instruments: Sequence[tuple[str, str]]
     ) -> bool: ...
 
+    def instruments_healthy(
+        self, instruments: Sequence[tuple[str, str]]
+    ) -> bool: ...
+
     def health_snapshot(self) -> object: ...
 
 
@@ -128,6 +132,7 @@ class BackendMarketDataService:
             repository=runtime.repository,
             ingestion_service=ingestion,
             read_models=runtime.market_read_model,
+            leader_store=runtime.market_leaders,
             automation_service=automation,
             context_provider=context_provider,
             on_subscriptions=self._replace_subscriptions,
@@ -263,7 +268,16 @@ class BackendMarketDataService:
             acquisition.get("decision_inputs_configured") is True
         )
         transport_healthy = socket.get("healthy") is True
-        data_healthy = lifecycle == "RUNNING"
+        successful_data = acquisition.get(
+            "data_successful_markets",
+            acquisition.get("successful_markets"),
+        )
+        data_healthy = bool(
+            lifecycle in {"RUNNING", "PARTIAL"}
+            and isinstance(successful_data, int)
+            and not isinstance(successful_data, bool)
+            and successful_data > 0
+        )
 
         result: dict[str, object] = {
             "provider": "DHAN",
@@ -283,6 +297,7 @@ class BackendMarketDataService:
         for name in (
             "master_batch_id",
             "last_master_refresh",
+            "last_master_attempt",
             "last_cycle_started_at",
             "last_cycle_completed_at",
             "last_success_at",
@@ -336,13 +351,21 @@ class BackendMarketDataService:
     def _replace_subscriptions(
         self, subscriptions: tuple[tuple[str, str], ...]
     ) -> None:
-        if not subscriptions:
-            raise ValueError("Dhan acquisition returned no live subscriptions")
+        detached_feed: LiveFeedRuntime | None = None
         with self._lock:
             if self._stopping or self._closed or self._credentials is None:
                 return
             feed = self._live_feed
-            if feed is not None:
+            if not subscriptions:
+                # An empty generation is meaningful after contract rollover or when
+                # every cached resolution has expired. Detach under the state lock so
+                # no obsolete feed remains authoritative, then stop it without holding
+                # the lock used by lifecycle and future subscription callbacks.
+                if feed is None:
+                    return
+                self._live_feed = None
+                detached_feed = feed
+            elif feed is not None:
                 changed = feed.replace_instruments(subscriptions)
                 _LOGGER.info(
                     "market_feed %s",
@@ -356,38 +379,75 @@ class BackendMarketDataService:
                     ),
                 )
                 return
-            feed = self._live_feed_factory(
-                self._credentials,
-                subscriptions,
-                on_packet=self._runtime.market_read_model.publish_feed_tick,
-                config=DhanFeedSupervisorConfig(
-                    idle_reconnect_seconds=self._settings.feed_idle_timeout_seconds,
-                    data_stale_seconds=self._settings.live_max_age_seconds,
-                ),
-                backoff=BoundedBackoff(
-                    maximum_seconds=self._settings.feed_reconnect_max_seconds
-                ),
-            )
-            self._live_feed = feed
-            # Start while retaining the state lock. Shutdown can only capture this feed
-            # after start has returned, eliminating an orphan start-after-stop race.
-            try:
-                feed.start()
-                _LOGGER.info(
-                    "market_feed %s",
-                    json.dumps(
-                        {
-                            "event": "websocket_start",
-                            "instruments": len(subscriptions),
-                            "state": "INITIALIZING",
-                        },
-                        sort_keys=True,
+            else:
+                feed = self._live_feed_factory(
+                    self._credentials,
+                    subscriptions,
+                    on_packet=self._runtime.market_read_model.publish_feed_tick,
+                    config=DhanFeedSupervisorConfig(
+                        idle_reconnect_seconds=self._settings.feed_idle_timeout_seconds,
+                        data_stale_seconds=self._settings.live_max_age_seconds,
+                    ),
+                    backoff=BoundedBackoff(
+                        maximum_seconds=self._settings.feed_reconnect_max_seconds
                     ),
                 )
-            except BaseException:
-                if self._live_feed is feed:
-                    self._live_feed = None
-                raise
+                self._live_feed = feed
+                # Start while retaining the state lock. Shutdown can only capture this
+                # feed after start returns, eliminating an orphan start-after-stop race.
+                try:
+                    feed.start()
+                    _LOGGER.info(
+                        "market_feed %s",
+                        json.dumps(
+                            {
+                                "event": "websocket_start",
+                                "instruments": len(subscriptions),
+                                "state": "INITIALIZING",
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                except BaseException:
+                    if self._live_feed is feed:
+                        self._live_feed = None
+                    raise
+                return
+
+        assert detached_feed is not None
+        try:
+            stopped = detached_feed.stop(timeout_seconds=5.0)
+        except BaseException:
+            with self._lock:
+                if (
+                    self._live_feed is None
+                    and not self._stopping
+                    and not self._closed
+                ):
+                    self._live_feed = detached_feed
+            raise
+        if not stopped:
+            # Keep the handle reachable for a later shutdown/retry when no newer
+            # subscription generation claimed the slot in the meantime.
+            with self._lock:
+                if (
+                    self._live_feed is None
+                    and not self._stopping
+                    and not self._closed
+                ):
+                    self._live_feed = detached_feed
+            raise RuntimeError("obsolete Dhan live-feed worker did not stop")
+        _LOGGER.info(
+            "market_feed %s",
+            json.dumps(
+                {
+                    "event": "subscriptions_cleared",
+                    "instruments": 0,
+                    "state": "STOPPED",
+                },
+                sort_keys=True,
+            ),
+        )
 
     def _replace_contracts(
         self,
@@ -422,7 +482,35 @@ class BackendMarketDataService:
         healthy = False
         if feed is not None:
             try:
-                healthy = _object_health(feed.health_snapshot()).get("healthy") is True
+                future = contract.futures
+                if future is not None:
+                    required = (
+                        (
+                            contract.underlying.segment,
+                            contract.underlying.security_id,
+                        ),
+                        (
+                            future.instrument.segment,
+                            future.instrument.security_id,
+                        ),
+                        *(
+                            (
+                                record.instrument.segment,
+                                record.instrument.security_id,
+                            )
+                            for record in contract.option_contracts
+                        ),
+                    )
+                    checker = getattr(feed, "instruments_healthy", None)
+                    if callable(checker):
+                        healthy = checker(required) is True
+                    else:
+                        # Preserve fail-closed compatibility with injected legacy
+                        # supervisors while production uses contract-scoped health.
+                        healthy = (
+                            _object_health(feed.health_snapshot()).get("healthy")
+                            is True
+                        )
             except Exception:  # noqa: BLE001 - feed health must gate fail-closed
                 healthy = False
         if healthy:

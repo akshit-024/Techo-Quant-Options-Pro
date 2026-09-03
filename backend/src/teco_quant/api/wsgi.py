@@ -12,6 +12,7 @@ from math import isfinite
 from typing import Any, Protocol, TypeAlias
 from urllib.parse import parse_qsl, urlsplit
 
+from teco_quant.api.market_leaders import MarketLeaderReader
 from teco_quant.api.market_read_model import MarketWorkspaceReader
 from teco_quant.execution.controller import ExecutionController
 from teco_quant.execution.errors import ExecutionError
@@ -50,12 +51,14 @@ class JsonWSGIApp:
         *,
         signal_history: SignalHistoryReader | None = None,
         market_reader: MarketWorkspaceReader | None = None,
+        market_leaders: MarketLeaderReader | None = None,
         feed_health: FeedHealthProvider | None = None,
     ) -> None:
         self.controller = controller
         self.config = config or ApiConfig()
         self.signal_history = signal_history
         self.market_reader = market_reader
+        self.market_leaders = market_leaders
         self.feed_health = feed_health
 
     def __call__(
@@ -152,6 +155,14 @@ class JsonWSGIApp:
             _reject_query(query_string)
             reader = self._require_market_reader()
             return self._respond(start_response, 200, reader.markets(), cors)
+        if path == "/market/leaders":
+            market_id = _market_leader_selection(query_string)
+            return self._respond(
+                start_response,
+                200,
+                self._require_market_leaders().leaders(market_id),
+                cors,
+            )
         market_methods = {
             "/contracts": "contract",
             "/market/workspace": "workspace",
@@ -230,6 +241,15 @@ class JsonWSGIApp:
                 "market read models are not configured",
             )
         return self.market_reader
+
+    def _require_market_leaders(self) -> MarketLeaderReader:
+        if self.market_leaders is None:
+            raise ApiError(
+                503,
+                "MARKET_LEADERS_UNAVAILABLE",
+                "market leader data is not configured",
+            )
+        return self.market_leaders
 
     def _market_data_status(self) -> dict[str, object]:
         revision = self.market_reader.revision if self.market_reader is not None else 0
@@ -523,6 +543,13 @@ def _market_selection(query_string: str) -> tuple[str, str, str | None]:
     if expiry is not None:
         _validate_expiry(expiry)
     return market, symbol, expiry
+
+
+def _market_leader_selection(query_string: str) -> str:
+    values = _parse_query(query_string, allowed=frozenset({"market"}))
+    market = _query_text(values, "market", required=True, maximum_length=64)
+    assert market is not None
+    return market
 
 
 def _validate_expiry(value: str) -> None:

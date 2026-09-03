@@ -15,6 +15,7 @@ from teco_quant.api import (
     ApiConfig,
     FeedHealthProvider,
     JsonWSGIApp,
+    MarketLeaderStore,
     MarketReadModelStore,
 )
 from teco_quant.automation import SignalHistoryRepository
@@ -34,6 +35,7 @@ class BackendRuntime:
     execution_ledger: ExecutionLedger
     signal_history: SignalHistoryRepository
     market_read_model: MarketReadModelStore
+    market_leaders: MarketLeaderStore
     controller: ExecutionController
     application: JsonWSGIApp
     _additional_cleanup: list[Callable[[], None]] = field(
@@ -158,6 +160,9 @@ def create_runtime(
         execution_ledger = ExecutionLedger(settings.execution_database_path)
         signal_history = SignalHistoryRepository(settings.signal_history_database_path)
         market_read_model = MarketReadModelStore()
+        market_leaders = MarketLeaderStore(
+            maximum_age_seconds=settings.live_max_age_seconds,
+        )
         policy = ExecutionPolicy(
             mode=ExecutionMode(settings.execution_mode),
             max_data_age_seconds=settings.live_max_age_seconds,
@@ -178,6 +183,7 @@ def create_runtime(
             ),
             signal_history=signal_history,
             market_reader=market_read_model,
+            market_leaders=market_leaders,
             feed_health=feed_health or (lambda: _default_feed_health(settings)),
         )
         return BackendRuntime(
@@ -186,6 +192,7 @@ def create_runtime(
             execution_ledger=execution_ledger,
             signal_history=signal_history,
             market_read_model=market_read_model,
+            market_leaders=market_leaders,
             controller=controller,
             application=application,
         )

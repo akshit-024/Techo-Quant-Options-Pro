@@ -303,6 +303,31 @@ class DhanAcquisitionTests(unittest.TestCase):
         self.assertIsNone(second_health["callback_error_code"])
         self.assertEqual(second_health["lifecycle_state"], "RUNNING")
 
+    def test_initial_failed_resolution_does_not_deliver_empty_callbacks(self) -> None:
+        client = PartialExpiryClient(self.clock)
+        subscription_deliveries = []
+        contract_deliveries = []
+        service = DhanAcquisitionService(
+            client=client,
+            repository=self.repository,
+            ingestion_service=self.ingestion,
+            read_models=self.read_models,
+            symbols=("TCS",),
+            clock=self.clock,
+            on_subscriptions=subscription_deliveries.append,
+            on_contracts=lambda contracts, registries: contract_deliveries.append(
+                (contracts, registries)
+            ),
+            close_client_on_stop=False,
+        )
+
+        result = service.run_once(now=self.clock.value)
+
+        self.assertFalse(result.markets[0].success)
+        self.assertEqual(subscription_deliveries, [])
+        self.assertEqual(contract_deliveries, [])
+        self.assertIsNone(service.health_snapshot()["callback_error_code"])
+
     def test_partial_resolution_keeps_exact_last_complete_subscription_generation(self) -> None:
         client = PartialAfterBaselineClient(self.clock)
         deliveries = []

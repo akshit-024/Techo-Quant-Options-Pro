@@ -19,12 +19,14 @@ import { buildRiskTradePlan, snapshotRiskDefaults } from "./domain/risk";
 import { GreeksView } from "./features/analytics/GreeksView";
 import { CalculatorView } from "./features/calculator/CalculatorView";
 import { DashboardView } from "./features/dashboard/DashboardView";
+import { MarketLeadersView } from "./features/leaders/MarketLeadersView";
 import { RankingView } from "./features/ranking/RankingView";
 import { StartView } from "./features/start/StartView";
 import { RiskWorkspace } from "./features/risk";
 import { ApiStatusView } from "./features/status/ApiStatusView";
 import { useBackendStatus } from "./hooks/useBackendStatus";
 import { useLiveMarketData } from "./hooks/useLiveMarketData";
+import { useMarketLeaders } from "./hooks/useMarketLeaders";
 import type {
   MarketCatalogResponse,
   MarketCatalogSymbol,
@@ -54,17 +56,6 @@ const guideDestinations: Readonly<Record<string, ViewId>> = {
   Settings: "settings",
 };
 
-function isMarketId(value: string): value is MarketId {
-  return Object.hasOwn(MARKET_DEFINITIONS, value);
-}
-
-function catalogMarketIds(catalog: MarketCatalogResponse | null): readonly MarketId[] {
-  if (catalog === null) return [];
-  return catalog.markets
-    .map((market) => market.market_id)
-    .filter(isMarketId);
-}
-
 function catalogSymbol(
   catalog: MarketCatalogResponse | null,
   market: MarketId,
@@ -78,23 +69,40 @@ function selectionForCatalog(
   current: WorkspaceSelection,
   catalog: MarketCatalogResponse | null,
 ): WorkspaceSelection {
-  const marketIds = catalogMarketIds(catalog);
-  if (marketIds.length === 0) return current;
-  const market = marketIds.includes(current.market) ? current.market : marketIds[0];
-  const marketEntry = catalog?.markets.find((item) => item.market_id === market);
-  const symbols = marketEntry?.symbols ?? [];
-  if (symbols.length === 0) return current;
-  const selectedSymbol =
-    symbols.find((item) => item.symbol === current.symbol) ?? symbols[0];
+  // A catalog is a publication snapshot, not the configured universe. If one
+  // market is temporarily absent, never jump the user's selection to whichever
+  // market happened to publish first.
+  const marketEntry = catalog?.markets.find(
+    (item) => item.market_id === current.market,
+  );
+  const selectedSymbol = marketEntry?.symbols.find(
+    (item) => item.symbol === current.symbol,
+  );
+  if (selectedSymbol === undefined) return current;
   const matchedExpiry = selectedSymbol.expiries.find(
     (expiry) =>
       expiry === current.expiry || expiry.slice(0, 10) === current.expiry.slice(0, 10),
   );
   return {
-    market,
+    market: current.market,
     symbol: selectedSymbol.symbol,
     expiry: matchedExpiry ?? selectedSymbol.expiries[0] ?? current.expiry,
   };
+}
+
+function uniqueOptions(values: readonly string[]): readonly string[] {
+  return [...new Set(values)];
+}
+
+function snapshotMatchesSelection(
+  snapshot: MarketSnapshot,
+  selection: WorkspaceSelection,
+): boolean {
+  return (
+    snapshot.selection.market === selection.market &&
+    snapshot.selection.symbol === selection.symbol &&
+    snapshot.selection.expiry === selection.expiry
+  );
 }
 
 function retainedAsStale(
@@ -142,6 +150,9 @@ export default function App() {
   const liveMarket = useLiveMarketData(apiSelection, {
     enabled: dataSourceMode === "LIVE",
   });
+  const marketLeaders = useMarketLeaders(selection.market, {
+    enabled: dataSourceMode === "LIVE" && activeView === "market_leaders",
+  });
 
   useEffect(() => {
     if (dataSourceMode !== "LIVE" || liveMarket.catalog === null) return;
@@ -167,6 +178,12 @@ export default function App() {
     }
     try {
       const adapted = adaptBackendSnapshot(liveMarket.workspace);
+      if (!snapshotMatchesSelection(adapted, selection)) {
+        return {
+          snapshot: null,
+          error: "An obsolete workspace response was discarded after the market selection changed.",
+        };
+      }
       return {
         snapshot:
           liveMarket.stale && adapted.dataMode === "LIVE"
@@ -186,61 +203,101 @@ export default function App() {
             : "The backend workspace could not be represented safely.",
       };
     }
-  }, [liveMarket.error, liveMarket.stale, liveMarket.workspace]);
-  const snapshot =
-    dataSourceMode === "LIVE" && liveAdaptation.snapshot !== null
-      ? liveAdaptation.snapshot
-      : demoSnapshot;
+  }, [liveMarket.error, liveMarket.stale, liveMarket.workspace, selection]);
+  // LIVE mode must never silently fall back to demo data.
+  // Demo data is used only when the user explicitly selects DEMO.
+  const snapshot: MarketSnapshot | null =
+    dataSourceMode === "LIVE" ? liveAdaptation.snapshot : demoSnapshot;
+
   const liveWorkspaceUnavailable =
-    dataSourceMode === "LIVE" && liveAdaptation.snapshot === null;
+    dataSourceMode === "LIVE" && snapshot === null;
+  const liveWorkspaceStale =
+    dataSourceMode === "LIVE" && snapshot?.dataMode === "STALE";
+
   const gateConnection =
     dataSourceMode === "LIVE" && liveMarket.connection !== "LIVE"
       ? liveMarket.workspace === null
         ? "DISCONNECTED"
         : "STALE"
       : backendStatus.connection;
+
   const operationalGate = useMemo(
-    () => evaluateOperationalGate(snapshot, { connectionState: gateConnection }),
+    () =>
+      snapshot === null
+        ? null
+        : evaluateOperationalGate(snapshot, {
+            connectionState: gateConnection,
+          }),
     [gateConnection, snapshot],
   );
-  const fallbackLegKey = `${snapshot.ranking[0].strike}:${snapshot.ranking[0].side}`;
-  const effectiveSelectedLegKey = snapshot.ranking.some(
-    (entry) => `${entry.strike}:${entry.side}` === selectedLegKey,
-  )
-    ? selectedLegKey
-    : fallbackLegKey;
+
+  const firstRankedLeg =
+    snapshot?.ranking.find((entry) => entry.rejectionReasons.length === 0) ??
+    snapshot?.ranking[0] ??
+    null;
+
+  const fallbackLegKey =
+    firstRankedLeg === null
+      ? ""
+      : `${firstRankedLeg.strike}:${firstRankedLeg.side}`;
+
+  const effectiveSelectedLegKey =
+    snapshot !== null &&
+    snapshot.ranking.some(
+      (entry) => `${entry.strike}:${entry.side}` === selectedLegKey,
+    )
+      ? selectedLegKey
+      : fallbackLegKey;
+
   const defaultRiskEvaluation = useMemo(() => {
-    const defaults = snapshotRiskDefaults(snapshot, effectiveSelectedLegKey);
-    return buildRiskTradePlan(snapshot, effectiveSelectedLegKey, {
-      capital: defaults.capital,
-      riskPercent: defaults.riskPercent,
-      allocationPercent: defaults.allocationPercent,
-      stop: defaults.stop,
-    });
+    if (snapshot === null || effectiveSelectedLegKey === "") {
+      return null;
+    }
+
+    const defaults = snapshotRiskDefaults(
+      snapshot,
+      effectiveSelectedLegKey,
+    );
+
+    return buildRiskTradePlan(
+      snapshot,
+      effectiveSelectedLegKey,
+      {
+        capital: defaults.capital,
+        riskPercent: defaults.riskPercent,
+        allocationPercent: defaults.allocationPercent,
+        stop: defaults.stop,
+      },
+    );
   }, [effectiveSelectedLegKey, snapshot]);
 
   const activeCatalog = dataSourceMode === "LIVE" ? liveMarket.catalog : null;
-  const liveMarketOptions = catalogMarketIds(activeCatalog);
-  const marketOptions =
-    liveMarketOptions.length > 0
-      ? liveMarketOptions
-      : MARKET_ORDER;
+  // Keep every configured bracket selectable even while backend publication is
+  // partial. The catalog only supplies currently published symbols/expiries.
+  const marketOptions = MARKET_ORDER;
   const catalogMarket = activeCatalog?.markets.find(
     (item) => item.market_id === selection.market,
   );
-  const symbolOptions =
-    catalogMarket !== undefined && catalogMarket.symbols.length > 0
-      ? catalogMarket.symbols.map((item) => item.symbol)
-      : MARKET_DEFINITIONS[selection.market].symbols;
+  const symbolOptions = uniqueOptions([
+    ...MARKET_DEFINITIONS[selection.market].symbols,
+    ...(catalogMarket?.symbols.map((item) => item.symbol) ?? []),
+    selection.symbol,
+  ]);
   const selectedCatalogSymbol = catalogSymbol(
     activeCatalog,
     selection.market,
     selection.symbol,
   );
   const expiryOptions =
-    selectedCatalogSymbol !== null && selectedCatalogSymbol.expiries.length > 0
-      ? selectedCatalogSymbol.expiries
-      : MARKET_DEFINITIONS[selection.market].expiries;
+    dataSourceMode === "LIVE"
+      ? uniqueOptions([
+          ...(selectedCatalogSymbol?.expiries ?? []),
+          selection.expiry,
+        ])
+      : uniqueOptions([
+          ...MARKET_DEFINITIONS[selection.market].expiries,
+          selection.expiry,
+        ]);
 
   const selectMarket = (market: MarketId, navigateToCalculator = false) => {
     const definition = MARKET_DEFINITIONS[market];
@@ -276,7 +333,7 @@ export default function App() {
   };
 
   const setOverride = (id: string, value: string) => {
-    if (snapshot.dataMode !== "DEMO") return;
+    if (snapshot === null || snapshot.dataMode !== "DEMO") return;
     setManualOverrides((current) => {
       const next = { ...current };
       if (value.trim()) next[id] = value.trim();
@@ -285,9 +342,19 @@ export default function App() {
     });
   };
   const feedStatus = backendStatus.payload?.status.market_data?.feed;
+  const selectedFeedStatus = feedStatus?.markets?.[selection.symbol];
+  const selectedFeedFailure =
+    selectedFeedStatus?.error_code == null
+      ? null
+      : `${selection.symbol} acquisition failed safely (${selectedFeedStatus.error_code}).`;
+  const authorityBlockers = snapshot?.backendAuthority?.blockers;
   const liveUnavailableReason =
     liveAdaptation.error ??
+    selectedFeedFailure ??
     liveMarket.error ??
+    (authorityBlockers !== undefined && authorityBlockers.length > 0
+      ? authorityBlockers.join(", ")
+      : null) ??
     (liveMarket.connection === "LOADING"
       ? "Waiting for the backend market catalog and first validated snapshot."
       : liveMarket.connection === "EMPTY"
@@ -309,9 +376,9 @@ export default function App() {
       />
       <div className="workspace">
         <WorkspaceHeader
-          capturedAt={snapshot.capturedAt}
+          capturedAt={snapshot?.capturedAt ?? ""}
           backendConnection={backendStatus.connection}
-          dataMode={snapshot.dataMode}
+          dataMode={snapshot?.dataMode ?? "UNAVAILABLE"}
           dataSourceMode={dataSourceMode}
           expiryOptions={expiryOptions}
           marketOptions={marketOptions}
@@ -331,20 +398,28 @@ export default function App() {
           symbolOptions={symbolOptions}
         />
         <main className="main-content" id="main-content">
-          {liveWorkspaceUnavailable ? (
+          {liveWorkspaceUnavailable || liveWorkspaceStale ? (
             <aside className="live-data-notice" aria-label="Live market data status">
               <div>
-                <strong>Live workspace unavailable</strong>
-                <p>{liveUnavailableReason} A non-actionable demo preview is shown below.</p>
+                <strong>
+                  {liveWorkspaceStale
+                    ? "Live workspace stale"
+                    : "Live workspace unavailable"}
+                </strong>
+                <p>
+                  {liveUnavailableReason} Demo data will not be substituted while LIVE is selected.
+                </p>
               </div>
               <div className="live-data-notice__actions">
                 <button onClick={liveMarket.refresh} type="button">Retry live data</button>
-                <button onClick={() => setDataSourceMode("DEMO")} type="button">Use demo workspace</button>
               </div>
             </aside>
           ) : null}
           {activeView === "start" ? <StartView onNavigate={setActiveView} /> : null}
-          {activeView === "dashboard" ? (
+          {activeView === "dashboard" &&
+          snapshot !== null &&
+          operationalGate !== null &&
+          defaultRiskEvaluation !== null ? (
             <DashboardView
               onLegSelect={setSelectedLegKey}
               onNavigate={setActiveView}
@@ -354,7 +429,7 @@ export default function App() {
               snapshot={snapshot}
             />
           ) : null}
-          {activeView === "calculator" ? (
+          {activeView === "calculator" && snapshot !== null ? (
             <CalculatorView
               onLegSelect={setSelectedLegKey}
               onOverride={setOverride}
@@ -363,28 +438,41 @@ export default function App() {
               snapshot={snapshot}
             />
           ) : null}
-          {activeView === "greeks" ? (
+          {activeView === "greeks" && snapshot !== null ? (
             <GreeksView
               onLegSelect={setSelectedLegKey}
               selectedLegKey={effectiveSelectedLegKey}
               snapshot={snapshot}
             />
           ) : null}
-          {activeView === "ranking" ? (
+          {activeView === "market_leaders" ? (
+            <MarketLeadersView
+              key={selection.market}
+              connection={marketLeaders.connection}
+              dataSourceMode={dataSourceMode}
+              error={marketLeaders.error}
+              market={selection.market}
+              onMarketChange={(market) => selectMarket(market)}
+              onRefresh={marketLeaders.refresh}
+              response={marketLeaders.response}
+            />
+          ) : null}
+          {activeView === "ranking" && snapshot !== null ? (
             <RankingView
               onLegSelect={setSelectedLegKey}
               selectedLegKey={effectiveSelectedLegKey}
               snapshot={snapshot}
             />
           ) : null}
-          {activeView === "position_sizer" || activeView === "trade_plan" ? (
+          {(activeView === "position_sizer" || activeView === "trade_plan") &&
+          snapshot !== null ? (
             <RiskWorkspace
               onLegSelect={setSelectedLegKey}
               selectedLegKey={effectiveSelectedLegKey}
               snapshot={snapshot}
             />
           ) : null}
-          {activeView === "api_status" ? (
+          {activeView === "api_status" && snapshot !== null ? (
             <ApiStatusView snapshot={snapshot} state={backendStatus} />
           ) : null}
           {activeView === "signals" ? <SignalHistoryView /> : null}
@@ -405,7 +493,9 @@ export default function App() {
               }}
             />
           ) : null}
-          {activeView === "audit" ? <FormulaAuditView snapshot={snapshot} /> : null}
+          {activeView === "audit" && snapshot !== null ? (
+            <FormulaAuditView snapshot={snapshot} />
+          ) : null}
         </main>
         <footer className="app-footer">
           <p>For education and analytical support only. Not investment advice. Live, stale, and demo data are explicitly labelled.</p>

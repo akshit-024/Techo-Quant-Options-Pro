@@ -649,6 +649,35 @@ class DhanLiveFeedSupervisor:
                 last_error=self._last_error,
             )
 
+    def instruments_healthy(
+        self,
+        instruments: Iterable[tuple[str, str | int] | DhanFeedInstrument],
+    ) -> bool:
+        """Return freshness for one coherent contract subset.
+
+        A single Dhan connection can carry instruments from exchanges with different
+        sessions and liquidity. Global health deliberately remains strict for diagnostics,
+        while decision gating can use this method to require every leg of only the exact
+        contract being evaluated. Unknown or unsubscribed identities fail closed.
+        """
+
+        selected = _normalize_instruments(instruments)
+        requested_keys = frozenset(
+            (instrument.segment_code, instrument.security_id)
+            for instrument in selected
+        )
+        now = self._clock()
+        wall_time = self._utc_now()
+        with self._lock:
+            self._refresh_health_locked(now, wall_time)
+            ready_keys = self._fresh_ready_keys_locked(now, wall_time)
+            return bool(
+                self._connected
+                and self._market_status is not DhanMarketStatus.CLOSED
+                and requested_keys.issubset(self._expected_keys)
+                and requested_keys.issubset(ready_keys)
+            )
+
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
             socket: DhanFeedSocket | None = None

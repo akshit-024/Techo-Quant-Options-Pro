@@ -9,6 +9,7 @@ import type {
   OptionLeg,
   OptionStrike,
   RankingEntry,
+  WorkspaceSelection,
 } from "../domain/types";
 
 export type BackendSnapshotAdapterErrorCode =
@@ -202,8 +203,13 @@ export function adaptBackendSnapshot(
     rankings,
     strikeInterval: strikeInterval.number,
   });
-  validateOptionContracts(contract.option_contracts, chain, optionExpiry, lotSize);
-  const ranking = buildRanking(chain, rankings);
+  const contractNames = validateOptionContracts(
+    contract.option_contracts,
+    chain,
+    optionExpiry,
+    lotSize,
+  );
+  const ranking = buildRanking(chain, rankings, contractNames, selection);
 
   validateActionablePlan({
     actionable,
@@ -522,7 +528,7 @@ function validateOptionContracts(
   chain: readonly OptionStrike[],
   expiry: string,
   lotSize: number,
-): void {
+): ReadonlyMap<string, string> {
   const contracts = arrayValue(raw, "contract.option_contracts");
   if (contracts.length !== 10) {
     fail(
@@ -531,12 +537,16 @@ function validateOptionContracts(
       "contract master must bind the exact ten option-chain legs",
     );
   }
+
   const expected = new Map<string, { strike: number; side: "CE" | "PE" }>();
   for (const row of chain) {
     expected.set(row.call.securityId, { strike: row.strike, side: "CE" });
     expected.set(row.put.securityId, { strike: row.strike, side: "PE" });
   }
+
   const observed = new Set<string>();
+  const contractNames = new Map<string, string>();
+
   contracts.forEach((rawContract, index) => {
     const path = `contract.option_contracts[${index}]`;
     const contract = record(rawContract, path);
@@ -545,6 +555,11 @@ function validateOptionContracts(
       instrument.security_id,
       `${path}.instrument.security_id`,
     );
+    const contractName = nonEmptyString(
+      instrument.symbol,
+      `${path}.instrument.symbol`,
+    );
+
     const bound = expected.get(securityId);
     if (bound === undefined || observed.has(securityId)) {
       mismatch(
@@ -552,7 +567,10 @@ function validateOptionContracts(
         "contract master identities do not match the coherent chain",
       );
     }
+
     observed.add(securityId);
+    contractNames.set(securityId, contractName);
+
     if (
       optionSide(contract.option_type, `${path}.option_type`) !== bound.side ||
       !sameNumber(
@@ -565,6 +583,15 @@ function validateOptionContracts(
       mismatch(path, "contract master leg differs from its market quote");
     }
   });
+
+  if (contractNames.size !== expected.size) {
+    mismatch(
+      "contract.option_contracts",
+      "every coherent option-chain security ID must have one verified instrument symbol",
+    );
+  }
+
+  return contractNames;
 }
 
 function parseRankings(raw: unknown): ReadonlyMap<string, ParsedRanking> {
@@ -745,12 +772,30 @@ function parseLeg(args: {
     mismatch(`${path}.ask`, "ask cannot be below bid");
   }
   const spread = nonNegativeDecimal(value.spread, `${path}.spread`).number;
-  if (!sameNumber(spread, ask - bid)) {
+
+  /*
+   * bid, ask, spread and spread_ratio originate as canonical decimal
+   * values in the Python backend, but JavaScript converts them to IEEE-754
+   * numbers. Subtraction/division can therefore introduce tiny binary
+   * floating-point differences even when the backend values are coherent.
+   *
+   * Keep strict sameNumber() checks for identity/topology fields, but use
+   * a narrowly bounded tolerance for these two derived quote values.
+   */
+  if (!sameDerivedNumber(spread, ask - bid)) {
     mismatch(`${path}.spread`, "reported spread does not match bid and ask");
   }
-  const spreadRatio = nonNegativeNumber(value.spread_ratio, `${path}.spread_ratio`);
-  if (!sameNumber(spreadRatio, spread / ask)) {
-    mismatch(`${path}.spread_ratio`, "reported spread ratio does not match bid and ask");
+
+  const spreadRatio = nonNegativeNumber(
+    value.spread_ratio,
+    `${path}.spread_ratio`,
+  );
+
+  if (!sameDerivedNumber(spreadRatio, spread / ask)) {
+    mismatch(
+      `${path}.spread_ratio`,
+      "reported spread ratio does not match bid and ask",
+    );
   }
 
   const ranking = rankings.get(securityId);
@@ -833,6 +878,8 @@ function validateEmbeddedRanking(
 function buildRanking(
   chain: readonly OptionStrike[],
   rankings: ReadonlyMap<string, ParsedRanking>,
+  contractNames: ReadonlyMap<string, string>,
+  selection: WorkspaceSelection,
 ): readonly RankingEntry[] {
   const legs = new Map(
     chain.flatMap((row) => [
@@ -840,6 +887,7 @@ function buildRanking(
       [row.put.securityId, { strike: row.strike, leg: row.put }] as const,
     ]),
   );
+
   return [...rankings.values()]
     .sort((left, right) => left.rank - right.rank)
     .map((entry): RankingEntry => {
@@ -850,10 +898,23 @@ function buildRanking(
           "ranking contains a security outside the five-strike chain",
         );
       }
+
+      const providerContractName = contractNames.get(entry.securityId);
+      if (providerContractName === undefined) {
+        mismatch(
+          "contract.option_contracts",
+          "ranked option security has no verified Dhan instrument symbol",
+        );
+      }
+
       return {
         rank: entry.rank,
         side: entry.side,
         strike: matched.strike,
+        // MCX master rows may expose only a generic underlying name. Build the
+        // visible label solely from already verified contract fields; quote and
+        // selection identity remain bound to the exact Dhan security ID above.
+        contractName: `${selection.symbol} ${selection.expiry.slice(0, 10)} ${entry.strike} ${entry.side}`,
         score: entry.score,
         band: scoreBand(entry.score),
         askEntry: entry.entryAsk,
@@ -1297,6 +1358,23 @@ function decisionValue(value: unknown, path: string): Decision {
 function sameNumber(left: number, right: number): boolean {
   const scale = Math.max(1, Math.abs(left), Math.abs(right));
   return Math.abs(left - right) <= Number.EPSILON * scale * 16;
+}
+
+/*
+ * Derived market values such as ask - bid and spread / ask are calculated
+ * after decimal values cross the JSON -> JavaScript number boundary.
+ *
+ * A tolerance of 1e-6 is tiny for quoted option prices/ratios and prevents
+ * false rejections caused solely by IEEE-754 arithmetic. Material
+ * inconsistencies (for example a 0.01 price mismatch) still fail closed.
+ *
+ * Do NOT use this helper for contract identity, strikes, expiry, ranking
+ * identity, or other canonical equality checks.
+ */
+function sameDerivedNumber(left: number, right: number): boolean {
+  const scale = Math.max(1, Math.abs(left), Math.abs(right));
+  const tolerance = Math.max(1e-6, Number.EPSILON * scale * 64);
+  return Math.abs(left - right) <= tolerance;
 }
 
 function mismatch(path: string, message: string): never {

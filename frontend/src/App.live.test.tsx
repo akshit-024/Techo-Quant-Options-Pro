@@ -103,6 +103,28 @@ describe("live application wiring", () => {
     expect(screen.queryByLabelText("Live market data status")).not.toBeInTheDocument();
     expect(screen.getByText("OPERATOR_PROFILE_REQUIRED")).toBeInTheDocument();
 
+    await user.click(screen.getByRole("button", { name: /Inspect ranking/ }));
+    const rankingHeading = screen.getByRole("heading", {
+      name: "NIFTY strike ranking",
+    });
+    const rankingSection = rankingHeading.closest("section");
+    if (!(rankingSection instanceof HTMLElement)) {
+      throw new Error("live ranking section missing");
+    }
+    expect(within(rankingSection).getByText("LIVE snapshot")).toBeInTheDocument();
+    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(5);
+    expect(
+      within(rankingSection).getByRole("group", {
+        name: `Ranking scope for NIFTY ${expiry}`,
+      }),
+    ).toBeInTheDocument();
+
+    await user.click(
+      within(
+        screen.getByRole("complementary", { name: "Primary navigation" }),
+      ).getByRole("button", { name: "Dashboard" }),
+    );
+
     await user.click(within(source).getByRole("button", { name: "Demo" }));
 
     expect(within(source).getByRole("button", { name: "Demo" })).toHaveAttribute(

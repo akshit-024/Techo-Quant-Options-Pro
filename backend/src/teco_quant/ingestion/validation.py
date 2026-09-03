@@ -404,6 +404,26 @@ class SnapshotValidator:
                     PricingModel.BLACK_SCHOLES,
                 )
 
+        # Dhan index derivatives use a derivative-family underlying ID that can
+        # differ from the quoteable IDX_I security ID.  Derive that family ID
+        # only when every selected option master record agrees on one non-empty
+        # provider underlying ID.  Stocks continue to require the derivative
+        # records to point directly at the quoteable equity security ID.
+        option_underlying_ids = {
+            record.underlying_security_id
+            for record in contract.option_contracts
+            if record.underlying_security_id
+        }
+        option_underlying_missing = any(
+            not record.underlying_security_id
+            for record in contract.option_contracts
+        )
+        derivative_underlying_id = (
+            next(iter(option_underlying_ids))
+            if len(option_underlying_ids) == 1 and not option_underlying_missing
+            else None
+        )
+
         future = contract.futures
         if future is None:
             self._error(
@@ -416,6 +436,7 @@ class SnapshotValidator:
             self._validate_future_record(
                 contract=contract,
                 expected_segment=expected_segment,
+                derivative_underlying_id=derivative_underlying_id,
                 issues=issues,
             )
 
@@ -450,16 +471,30 @@ class SnapshotValidator:
                 )
             seen_master_keys.add(key)
             seen_master_ids.add(record.instrument.security_id)
+            if contract.market_kind in (MarketKind.INDEX, MarketKind.COMMODITY):
+                underlying_matches = (
+                    derivative_underlying_id is not None
+                    and record.underlying_security_id == derivative_underlying_id
+                )
+            else:
+                underlying_matches = (
+                    record.underlying_security_id == contract.underlying.security_id
+                )
+
             if (
                 record.instrument.exchange is not contract.underlying.exchange
                 or record.instrument.segment.upper() != expected_segment
-                or record.underlying_security_id != contract.underlying.security_id
+                or not underlying_matches
             ):
                 self._error(
                     issues,
                     "OPTION_MASTER_IDENTITY_MISMATCH",
                     path,
-                    "option record exchange, segment, and underlying must match the contract",
+                    (
+                        "index and commodity option records must share one "
+                        "derivative-family underlying ID; stock option records "
+                        "must map directly to the selected equity underlying"
+                    ),
                 )
             if record.expiry != contract.option_expiry:
                 self._error(
@@ -483,6 +518,7 @@ class SnapshotValidator:
         *,
         contract: Any,
         expected_segment: str,
+        derivative_underlying_id: str | None,
         issues: list[ValidationIssue],
     ) -> None:
         future = contract.futures
@@ -506,12 +542,43 @@ class SnapshotValidator:
                     "contract.futures.instrument",
                     "MCX pricing underlying must be the exact mapped futures instrument",
                 )
+            if (
+                derivative_underlying_id is None
+                or future.underlying_security_id != derivative_underlying_id
+            ):
+                self._error(
+                    issues,
+                    "FUTURES_UNDERLYING_MISMATCH",
+                    "contract.futures.underlying_security_id",
+                    (
+                        "MCX futures and options must share one exact "
+                        "derivative-family underlying ID"
+                    ),
+                    future.underlying_security_id,
+                    derivative_underlying_id,
+                )
+        elif contract.market_kind is MarketKind.INDEX:
+            if (
+                derivative_underlying_id is None
+                or future.underlying_security_id != derivative_underlying_id
+            ):
+                self._error(
+                    issues,
+                    "FUTURES_UNDERLYING_MISMATCH",
+                    "contract.futures.underlying_security_id",
+                    (
+                        "index futures and options must share one exact "
+                        "derivative-family underlying ID"
+                    ),
+                    future.underlying_security_id,
+                    derivative_underlying_id,
+                )
         elif future.underlying_security_id != contract.underlying.security_id:
             self._error(
                 issues,
                 "FUTURES_UNDERLYING_MISMATCH",
                 "contract.futures.underlying_security_id",
-                "futures master record must map to the selected underlying",
+                "stock futures must map directly to the selected equity underlying",
                 future.underlying_security_id,
                 contract.underlying.security_id,
             )
@@ -536,12 +603,17 @@ class SnapshotValidator:
                     future.expiry,
                     contract.option_expiry,
                 )
-        if future.lot_size != contract.lot_size or future.tick_size != contract.tick_size:
+        # ContractSpec.lot_size/tick_size describe the selected option family.
+        # The covering future can legitimately use a different provider tick
+        # size, so only the lot-size relationship is enforced here.
+        if future.lot_size != contract.lot_size:
             self._error(
                 issues,
                 "FUTURES_MASTER_SPEC_MISMATCH",
                 "contract.futures",
-                "futures lot and tick must match the selected contract revision",
+                "futures lot size must match the selected option contract revision",
+                future.lot_size,
+                contract.lot_size,
             )
 
     def _validate_market(

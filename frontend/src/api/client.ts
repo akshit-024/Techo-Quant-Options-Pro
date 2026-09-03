@@ -21,7 +21,11 @@ import {
   type MarketDataMode,
   type MarketDataStatusResponse,
   type MarketFeedStatusResponse,
+  type MarketFeedInstrumentStatus,
   type MarketJsonRecord,
+  type MarketLeader,
+  type MarketLeadersResponse,
+  type MarketLeaderState,
   type MarketReadFreshness,
   type MarketReadStatus,
   type MarketSelection,
@@ -83,6 +87,10 @@ export interface MarketSelectionRequest extends MarketApiRequestOptions {
   selection: MarketSelection;
 }
 
+export interface MarketLeadersRequest extends MarketApiRequestOptions {
+  marketId: string;
+}
+
 export interface MarketUpdatesRequest extends Omit<MarketApiRequestOptions, "timeoutMs"> {
   after: number;
   timeoutSeconds?: number;
@@ -136,6 +144,17 @@ export function fetchMarketCatalog(
   options: MarketApiRequestOptions,
 ): Promise<MarketCatalogResponse> {
   return getSingleJson(options, READ_ONLY_ROUTES.markets, parseMarketCatalog);
+}
+
+export function fetchMarketLeaders(
+  { marketId, ...options }: MarketLeadersRequest,
+): Promise<MarketLeadersResponse> {
+  return getSingleJson(
+    options,
+    READ_ONLY_ROUTES.marketLeaders,
+    parseMarketLeaders,
+    new URLSearchParams({ market: boundedQueryText(marketId, "marketId", 64) }),
+  );
 }
 
 export function fetchMarketContract(
@@ -457,7 +476,50 @@ function parseMarketFeedStatus(
       route,
     );
   }
+  if (record.markets !== undefined) {
+    result.markets = parseMarketFeedInstruments(record.markets, route);
+  }
   return result;
+}
+
+function parseMarketFeedInstruments(
+  value: unknown,
+  route: ReadOnlyRoute,
+): Readonly<Record<string, MarketFeedInstrumentStatus>> {
+  const instruments = asRecord(value, route);
+  return Object.fromEntries(
+    Object.entries(instruments).map(([symbol, raw]) => {
+      const path = `market_data.feed.markets.${symbol}`;
+      const record = asRecord(raw, route);
+      const dataAge = nullableFiniteNumber(
+        record.data_age_seconds,
+        `${path}.data_age_seconds`,
+        route,
+      );
+      if (dataAge !== null && dataAge < 0) {
+        throw invalidResponse(route, `${path}.data_age_seconds must be non-negative`);
+      }
+      return [
+        symbol,
+        {
+          accepted: requiredBoolean(record.accepted, `${path}.accepted`, route),
+          last_attempt_at: nullableString(
+            record.last_attempt_at,
+            `${path}.last_attempt_at`,
+            route,
+          ),
+          last_success_at: nullableString(
+            record.last_success_at,
+            `${path}.last_success_at`,
+            route,
+          ),
+          data_age_seconds: dataAge,
+          snapshot_id: nullableString(record.snapshot_id, `${path}.snapshot_id`, route),
+          error_code: nullableString(record.error_code, `${path}.error_code`, route),
+        },
+      ];
+    }),
+  );
 }
 
 function parseKillSwitch(value: unknown, route: ReadOnlyRoute): KillSwitchStatus {
@@ -555,6 +617,80 @@ function parseMarketCatalog(
         latest: parseMarketReadStatus(symbol.latest, route),
       })),
     })),
+  };
+}
+
+function parseMarketLeaders(
+  value: unknown,
+  route: ReadOnlyRoute,
+): MarketLeadersResponse {
+  const record = asRecord(value, route);
+  const marketState = marketLeaderState(record.market_state, route);
+  const leaders = recordArray(record.leaders, "leaders", route).map(
+    (leader, index) => parseMarketLeader(leader, index, route),
+  );
+  const universeSize = nonNegativeInteger(record.universe_size, "universe_size", route);
+  const availableCount = nonNegativeInteger(
+    record.available_count,
+    "available_count",
+    route,
+  );
+  if (availableCount > universeSize) {
+    throw invalidResponse(route, "available_count cannot exceed universe_size");
+  }
+  if (leaders.length > availableCount) {
+    throw invalidResponse(route, "leaders cannot exceed available_count");
+  }
+  if (marketState === "UNAVAILABLE" && leaders.length > 0) {
+    throw invalidResponse(route, "unavailable market cannot contain leaders");
+  }
+  if (new Set(leaders.map((leader) => leader.symbol)).size !== leaders.length) {
+    throw invalidResponse(route, "leaders must contain unique symbols");
+  }
+  return {
+    market_id: requiredString(record.market_id, "market_id", route),
+    generated_at: nullableString(record.generated_at, "generated_at", route),
+    ranking_basis: rankingBasis(record.ranking_basis, route),
+    market_state: marketState,
+    universe_size: universeSize,
+    available_count: availableCount,
+    missing_symbols: stringArray(
+      record.missing_symbols,
+      "missing_symbols",
+      route,
+    ),
+    leaders,
+  };
+}
+
+function parseMarketLeader(
+  record: MarketJsonRecord,
+  index: number,
+  route: ReadOnlyRoute,
+): MarketLeader {
+  const path = `leaders[${index}]`;
+  return {
+    rank: positiveInteger(record.rank, `${path}.rank`, route),
+    symbol: requiredString(record.symbol, `${path}.symbol`, route),
+    display_name: requiredString(record.display_name, `${path}.display_name`, route),
+    last_price: decimalString(record.last_price, `${path}.last_price`, route),
+    previous_close: decimalString(
+      record.previous_close,
+      `${path}.previous_close`,
+      route,
+    ),
+    change: decimalString(record.change, `${path}.change`, route),
+    change_percent: finiteNumber(
+      record.change_percent,
+      `${path}.change_percent`,
+      route,
+    ),
+    volume:
+      record.volume === null
+        ? null
+        : nonNegativeInteger(record.volume, `${path}.volume`, route),
+    observed_at: requiredString(record.observed_at, `${path}.observed_at`, route),
+    data_mode: marketLeaderDataMode(record.data_mode, `${path}.data_mode`, route),
   };
 }
 
@@ -1005,6 +1141,14 @@ function finiteNumber(value: unknown, field: string, route: ReadOnlyRoute): numb
   return value;
 }
 
+function decimalString(value: unknown, field: string, route: ReadOnlyRoute): string {
+  const result = requiredString(value, field, route);
+  if (!Number.isFinite(Number(result))) {
+    throw invalidResponse(route, `${field} must be a finite decimal string`);
+  }
+  return result;
+}
+
 function nonNegativeNumber(value: unknown, field: string, route: ReadOnlyRoute): number {
   const result = finiteNumber(value, field, route);
   if (result < 0) throw invalidResponse(route, `${field} must be non-negative`);
@@ -1023,6 +1167,34 @@ function nullableFiniteNumber(
 function optionType(value: unknown, field: string, route: ReadOnlyRoute): "CE" | "PE" {
   if (value !== "CE" && value !== "PE") {
     throw invalidResponse(route, `${field} must be CE or PE`);
+  }
+  return value;
+}
+
+function marketLeaderState(value: unknown, route: ReadOnlyRoute): MarketLeaderState {
+  if (value !== "LIVE" && value !== "STALE" && value !== "UNAVAILABLE") {
+    throw invalidResponse(route, "market_state is invalid");
+  }
+  return value;
+}
+
+function marketLeaderDataMode(
+  value: unknown,
+  field: string,
+  route: ReadOnlyRoute,
+): "LIVE" | "STALE" {
+  if (value !== "LIVE" && value !== "STALE") {
+    throw invalidResponse(route, `${field} must be LIVE or STALE`);
+  }
+  return value;
+}
+
+function rankingBasis(
+  value: unknown,
+  route: ReadOnlyRoute,
+): "DAY_CHANGE_PERCENT_DESC" {
+  if (value !== "DAY_CHANGE_PERCENT_DESC") {
+    throw invalidResponse(route, "ranking_basis is invalid");
   }
   return value;
 }

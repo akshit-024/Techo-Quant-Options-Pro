@@ -1,5 +1,10 @@
 """Dependency-free API adapters and coherent market read models."""
 
+from teco_quant.api.market_leaders import (
+    MarketLeaderPublisher,
+    MarketLeaderReader,
+    MarketLeaderStore,
+)
 from teco_quant.api.market_read_model import (
     MarketReadModelEvent,
     MarketReadModelStore,
@@ -17,6 +22,9 @@ __all__ = [
     "FeedHealthProvider",
     "FeedHealthReader",
     "JsonWSGIApp",
+    "MarketLeaderPublisher",
+    "MarketLeaderReader",
+    "MarketLeaderStore",
     "MarketReadModelEvent",
     "MarketReadModelStore",
     "MarketWorkspaceReader",

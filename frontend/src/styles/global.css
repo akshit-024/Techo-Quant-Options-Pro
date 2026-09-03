@@ -761,6 +761,13 @@ table {
 .selected-contract-card__prices { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .selected-contract-card__prices span { display: grid; gap: 4px; color: var(--muted-2); font-size: 7px; }
 .selected-contract-card__prices strong { color: #dfe9ec; font: 650 10px/1 "Consolas", monospace; }
+.ranking-scope-panel { display: flex; align-items: center; gap: 11px; }
+.ranking-scope-panel__status { display: grid; justify-items: end; gap: 5px; }
+.ranking-scope-panel__status > span:last-child { color: var(--muted-2); font-size: 7px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.ranking-scope-toggle { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: #0e141c; }
+.ranking-scope-toggle button { min-width: 58px; min-height: 30px; padding: 0 9px; border: 0; border-radius: 6px; color: var(--muted-2); background: transparent; font-size: 8px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.ranking-scope-toggle button:hover { color: var(--text); }
+.ranking-scope-toggle button.is-active { color: var(--cyan); background: var(--cyan-soft); box-shadow: 0 1px 5px rgba(0,0,0,.25); }
 .ranking-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
 .ranking-table { min-width: 960px; font-size: 9px; }
 .ranking-table thead th { height: 34px; padding: 0 11px; color: #56646e; background: rgba(255,255,255,.02); font-size: 7px; font-weight: 800; letter-spacing: .09em; text-align: left; text-transform: uppercase; }
@@ -787,6 +794,24 @@ table {
 .legend-tradable { background: var(--blue); }
 .legend-watch { background: var(--amber); }
 .legend-blocked { background: var(--red); }
+
+/* Market leaders */
+.market-leaders-panel { display: grid; gap: 15px; }
+.market-bracket-filter { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; }
+.market-bracket-filter button { min-height: 34px; padding: 0 13px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: #0e141c; font-size: 8px; font-weight: 800; letter-spacing: .05em; white-space: nowrap; }
+.market-bracket-filter button:hover { color: var(--text); border-color: var(--line-strong); }
+.market-bracket-filter button.is-active { color: var(--cyan); border-color: rgba(66,232,195,.3); background: var(--cyan-soft); }
+.market-leader-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.market-leader-toolbar > span { color: var(--muted-2); font-size: 8px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+.market-leader-empty { display: flex; align-items: center; justify-content: space-between; gap: 18px; min-height: 120px; padding: 20px; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.12); }
+.market-leader-empty p { margin: 6px 0 0; color: var(--muted); }
+.market-leader-warning { padding: 10px 12px; border: 1px solid rgba(241,199,91,.2); border-radius: 8px; color: var(--amber); background: var(--amber-soft); font-size: 9px; }
+.market-leaders-table { min-width: 900px; }
+.market-leaders-table tbody th { display: grid; gap: 4px; }
+.market-leader-symbol { color: var(--muted-2); font: 650 8px/1 "Consolas", monospace; }
+.market-move--up { color: var(--green) !important; }
+.market-move--down { color: var(--red) !important; }
+.market-leader-missing { margin: 0; color: var(--muted-2); font-size: 8px; }
 
 /* Greeks */
 .greeks-hero { display: grid; grid-template-columns: .8fr 1.35fr .65fr; gap: 20px; }
@@ -886,6 +911,9 @@ table {
   .metric-strip article:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
   .section-header { flex-direction: column; gap: 9px; }
   .section-header__action { padding: 0; }
+  .ranking-scope-panel { align-items: flex-start; flex-direction: column; }
+  .ranking-scope-panel__status { justify-items: start; }
+  .market-leader-toolbar, .market-leader-empty { align-items: flex-start; flex-direction: column; }
   .content-section, .panel:not(.market-chart-card):not(.evidence-card) { padding: 16px; }
   .range-band { grid-template-columns: 1fr; }
   .range-band > div, .range-band > div:last-child { text-align: left; }

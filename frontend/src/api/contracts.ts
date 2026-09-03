@@ -11,6 +11,7 @@ export const READ_ONLY_ROUTES = {
   marketWorkspace: "/market/workspace",
   marketChain: "/market/chain",
   marketAnalytics: "/market/analytics",
+  marketLeaders: "/market/leaders",
   marketUpdates: "/market/updates",
 } as const;
 
@@ -71,6 +72,16 @@ export interface MarketFeedStatusResponse {
   successful_markets?: number;
   failed_markets?: number;
   missing_instruments?: readonly string[];
+  markets?: Readonly<Record<string, MarketFeedInstrumentStatus>>;
+}
+
+export interface MarketFeedInstrumentStatus {
+  accepted: boolean;
+  last_attempt_at: string | null;
+  last_success_at: string | null;
+  data_age_seconds: number | null;
+  snapshot_id: string | null;
+  error_code: string | null;
 }
 
 export interface MarketDataStatusResponse {
@@ -126,6 +137,32 @@ export interface MarketCatalogMarket {
 export interface MarketCatalogResponse {
   generated_at: string;
   markets: readonly MarketCatalogMarket[];
+}
+
+export type MarketLeaderState = "LIVE" | "STALE" | "UNAVAILABLE";
+
+export interface MarketLeader {
+  rank: number;
+  symbol: string;
+  display_name: string;
+  last_price: string;
+  previous_close: string;
+  change: string;
+  change_percent: number;
+  volume: number | null;
+  observed_at: string;
+  data_mode: "LIVE" | "STALE";
+}
+
+export interface MarketLeadersResponse {
+  market_id: string;
+  generated_at: string | null;
+  ranking_basis: "DAY_CHANGE_PERCENT_DESC";
+  market_state: MarketLeaderState;
+  universe_size: number;
+  available_count: number;
+  missing_symbols: readonly string[];
+  leaders: readonly MarketLeader[];
 }
 
 /** JSON-safe backend domain details whose leaf fields vary by instrument kind. */

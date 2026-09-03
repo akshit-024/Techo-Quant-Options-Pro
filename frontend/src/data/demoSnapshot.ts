@@ -192,11 +192,15 @@ function makeChain(
   });
 }
 
-function makeRanking(chain: readonly OptionStrike[]): readonly RankingEntry[] {
+function makeRanking(
+  chain: readonly OptionStrike[],
+  symbol: string,
+): readonly RankingEntry[] {
   const candidates = chain.flatMap((row) =>
     [row.call, row.put].map((leg) => ({
       side: leg.side,
       strike: row.strike,
+      contractName: `DEMO ${symbol} ${Math.round(row.strike)} ${leg.side}`,
       score: leg.strikeScore,
       band: scoreBand(leg.strikeScore),
       askEntry: leg.ask,
@@ -210,7 +214,9 @@ function makeRanking(chain: readonly OptionStrike[]): readonly RankingEntry[] {
 
   return candidates
     .sort((left, right) => {
-      const eligibility = Number(left.rejectionReasons.length > 0) - Number(right.rejectionReasons.length > 0);
+      const eligibility =
+        Number(left.rejectionReasons.length > 0) -
+        Number(right.rejectionReasons.length > 0);
       return eligibility || right.score - left.score;
     })
     .map((entry, index) => ({ ...entry, rank: index + 1 }));
@@ -280,7 +286,7 @@ export function buildDemoSnapshot(
   const eventRiskActive = !["CLEAR", "NO", "FALSE", "0"].includes(eventRiskValue);
   const atm = Math.round(spot / definition.strikeStep) * definition.strikeStep;
   const chain = makeChain(definition, spot, bias);
-  const ranking = makeRanking(chain);
+  const ranking = makeRanking(chain, selection.symbol);
   const callScore = Math.max(...chain.map((row) => row.call.strikeScore));
   const putScore = Math.max(...chain.map((row) => row.put.strikeScore));
   const scoreDecision = decisionFromScores(callScore, putScore);
