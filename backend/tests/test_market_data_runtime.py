@@ -186,6 +186,13 @@ class MarketDataRuntimeTests(unittest.TestCase):
                         "configured": True,
                         "subscriptions_count": 2,
                         "successful_markets": 1,
+                        "markets": {
+                            "NIFTY": {
+                                "accepted": True,
+                                "error_code": None,
+                                "data_age_seconds": 0.0,
+                            }
+                        },
                     }
                 )
                 health = integration.health_snapshot()

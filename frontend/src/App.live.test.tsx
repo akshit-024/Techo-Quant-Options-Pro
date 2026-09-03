@@ -17,6 +17,7 @@ vi.mock("./hooks/useLiveMarketData", () => ({
 
 vi.mock("./data/backendSnapshot", () => {
   class BackendSnapshotAdapterError extends Error {}
+
   return {
     BackendSnapshotAdapterError,
     adaptBackendSnapshot: (workspace: unknown) => workspace,
@@ -31,11 +32,13 @@ describe("live application wiring", () => {
   it("uses a backend-owned snapshot and switches to demo only by explicit choice", async () => {
     const user = userEvent.setup();
     const expiry = "2099-09-05T15:30:00+05:30";
+
     const demo = buildDemoSnapshot({
       market: "NIFTY",
       symbol: "NIFTY",
       expiry,
     });
+
     const liveSnapshot: MarketSnapshot = {
       ...demo,
       capturedAt: new Date().toISOString(),
@@ -72,6 +75,7 @@ describe("live application wiring", () => {
       isLoading: false,
       refresh: vi.fn(),
     };
+
     hookState.live = {
       connection: "LIVE",
       catalog: {
@@ -95,29 +99,31 @@ describe("live application wiring", () => {
     render(<App />);
 
     const source = screen.getByRole("group", { name: "Data source" });
-    expect(within(source).getByRole("button", { name: "Live" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+
+    expect(
+      within(source).getByRole("button", { name: "Live" }),
+    ).toHaveAttribute("aria-pressed", "true");
+
     expect(screen.getByText("live snapshot")).toBeInTheDocument();
     expect(screen.queryByLabelText("Live market data status")).not.toBeInTheDocument();
     expect(screen.getByText("OPERATOR_PROFILE_REQUIRED")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /Inspect ranking/ }));
+
     const rankingHeading = screen.getByRole("heading", {
       name: "NIFTY strike ranking",
     });
     const rankingSection = rankingHeading.closest("section");
+
     if (!(rankingSection instanceof HTMLElement)) {
       throw new Error("live ranking section missing");
     }
+
     expect(within(rankingSection).getByText("LIVE snapshot")).toBeInTheDocument();
-    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(5);
-    expect(
-      within(rankingSection).getByRole("group", {
-        name: `Ranking scope for NIFTY ${expiry}`,
-      }),
-    ).toBeInTheDocument();
+    expect(within(rankingSection).getByText("10 option legs")).toBeInTheDocument();
+    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(10);
+    expect(within(rankingSection).getByText("BEST")).toBeInTheDocument();
+    expect(within(rankingSection).getByText("SECOND")).toBeInTheDocument();
 
     await user.click(
       within(
@@ -127,10 +133,10 @@ describe("live application wiring", () => {
 
     await user.click(within(source).getByRole("button", { name: "Demo" }));
 
-    expect(within(source).getByRole("button", { name: "Demo" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(
+      within(source).getByRole("button", { name: "Demo" }),
+    ).toHaveAttribute("aria-pressed", "true");
+
     expect(screen.getByText("demo snapshot")).toBeInTheDocument();
     expect(screen.getByText("DEMO DATA")).toBeInTheDocument();
   });

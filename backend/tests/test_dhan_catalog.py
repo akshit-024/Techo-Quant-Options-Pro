@@ -90,7 +90,7 @@ class DhanCatalogTests(unittest.TestCase):
         self.assertEqual(resolved.contract.futures.instrument.security_id, "50001")
         self.assertEqual(resolved.contract.strike_interval, Decimal(50))
         self.assertEqual(len(resolved.contract.option_contracts), 10)
-        self.assertEqual(len(resolved.subscriptions), 12)
+        self.assertEqual(len(resolved.subscriptions), 11)
         self.assertEqual(resolved.option_chain_segment, "IDX_I")
         self.assertEqual(resolved.historical_instrument, "INDEX")
         self.assertEqual(batch.provenance.row_count, len(batch.records))

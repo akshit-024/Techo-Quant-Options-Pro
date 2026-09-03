@@ -62,8 +62,8 @@ export function MarketPulse({ snapshot }: MarketPulseProps) {
           </div>
           <div className="evidence-row">
             <span>Change-OI PCR</span>
-            <div className="evidence-meter evidence-meter--amber"><i style={{ width: `${Math.min(100, analytics.changeOiPcr * 58)}%` }} /></div>
-            <strong>{formatNumber(analytics.changeOiPcr)}</strong>
+            <div className="evidence-meter evidence-meter--amber"><i style={{ width: `${analytics.changeOiPcr === null ? 0 : Math.min(100, analytics.changeOiPcr * 58)}%` }} /></div>
+            <strong>{analytics.changeOiPcr === null ? "—" : formatNumber(analytics.changeOiPcr)}</strong>
           </div>
         </div>
         <div className="level-grid">

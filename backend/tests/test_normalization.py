@@ -117,12 +117,10 @@ def _market_quote_payload() -> dict:
 
 
 class NormalizationTests(unittest.TestCase):
-    def test_dhan_quote_uses_provider_trade_time_and_retains_http_receipt(self) -> None:
+    def test_dhan_quote_uses_http_receipt_as_observation_and_validates_ltt_format(self) -> None:
         received_at = datetime(2026, 8, 25, 6, 30, 5, tzinfo=UTC)
         payload = _market_quote_payload()
-        payload["data"]["IDX_I"]["13"]["last_trade_time"] = (
-            "25/08/2026 12:00:02"
-        )
+        payload["data"]["IDX_I"]["13"]["last_trade_time"] = "25/08/2026 12:00:02"
 
         quote = normalize_dhan_market_quote(
             payload,
@@ -131,7 +129,7 @@ class NormalizationTests(unittest.TestCase):
             observed_at=received_at,
         )
 
-        self.assertEqual(quote.observed_at.isoformat(), "2026-08-25T12:00:02+05:30")
+        self.assertEqual(quote.observed_at, received_at)
         self.assertEqual(quote.received_at, received_at)
         self.assertIsNone(quote.timestamp_warning)
 
@@ -150,14 +148,12 @@ class NormalizationTests(unittest.TestCase):
             "LAST_TRADE_TIME_ABSENT_RECEIPT_FALLBACK",
         )
 
-    def test_dhan_quote_rejects_malformed_sentinel_old_and_future_trade_times(self) -> None:
+    def test_dhan_quote_rejects_malformed_ltt_but_not_wall_clock_age(self) -> None:
         received_at = datetime(2026, 8, 25, 6, 30, 5, tzinfo=UTC)
+
         for value, message in (
             (None, "malformed"),
             ("2026-08-25T12:00:00", "DD/MM/YYYY"),
-            ("01/01/1980 00:00:00", "stale or a sentinel"),
-            ("25/08/2026 11:59:00", "stale or a sentinel"),
-            ("25/08/2026 12:00:10", "future-dated"),
         ):
             with self.subTest(value=value):
                 payload = _market_quote_payload()
@@ -169,6 +165,23 @@ class NormalizationTests(unittest.TestCase):
                         security_id="13",
                         observed_at=received_at,
                     )
+
+        for value in (
+            "01/01/1980 00:00:00",
+            "25/08/2026 11:59:00",
+            "25/08/2026 12:00:10",
+        ):
+            with self.subTest(value=value):
+                payload = _market_quote_payload()
+                payload["data"]["IDX_I"]["13"]["last_trade_time"] = value
+                quote = normalize_dhan_market_quote(
+                    payload,
+                    segment="IDX_I",
+                    security_id="13",
+                    observed_at=received_at,
+                )
+                self.assertEqual(quote.observed_at, received_at)
+                self.assertEqual(quote.received_at, received_at)
 
     def test_instrument_master_is_hashed_and_expiry_is_explicitly_resolved(self) -> None:
         csv_text = (

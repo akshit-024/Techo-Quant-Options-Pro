@@ -78,7 +78,7 @@ export interface OptionLeg {
   ltp: number;
   volume: number;
   openInterest: number;
-  changeOpenInterest: number;
+  changeOpenInterest: number | null;
   iv: number;
   spreadPercent: number;
   liquidityScore: number;
@@ -102,7 +102,7 @@ export interface AnalyticsSummary {
   trend: "BULLISH" | "BEARISH" | "MIXED";
   trendStrength: number;
   pcr: number;
-  changeOiPcr: number;
+  changeOiPcr: number | null;
   support: number;
   resistance: number;
   atmIv: number;

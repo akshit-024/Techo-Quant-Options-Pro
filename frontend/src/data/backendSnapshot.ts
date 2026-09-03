@@ -186,7 +186,7 @@ export function adaptBackendSnapshot(
     mismatch("chain.strike_interval", "chain and contract strike intervals differ");
   }
   const lotSize = positiveInteger(contract.lot_size, "contract.lot_size");
-  validateContractIdentity(contract, selection.symbol);
+  validateContractIdentity(contract);
   validateTechnicalState(technicals);
   validateStrategyContext(context);
   timestamp(analyticsRecord.generated_at, "analytics.generated_at");
@@ -301,7 +301,7 @@ export function adaptBackendSnapshot(
         analyticsRecord.put_call_ratio,
         "analytics.put_call_ratio",
       ),
-      changeOiPcr: finiteNumber(
+      changeOiPcr: optionalFiniteNumber(
         analyticsRecord.change_oi_put_call_ratio,
         "analytics.change_oi_put_call_ratio",
       ),
@@ -426,18 +426,11 @@ function validateMarketUnderlying(
 
 function validateContractIdentity(
   contract: Record<string, unknown>,
-  selectedSymbol: string,
 ): void {
   const underlying = record(contract.underlying, "contract.underlying");
-  if (
-    nonEmptyString(underlying.symbol, "contract.underlying.symbol") !==
-    selectedSymbol
-  ) {
-    mismatch(
-      "contract.underlying.symbol",
-      "selected symbol differs from the contract underlying",
-    );
-  }
+  // Contract identity is provider-exact. Requested canonical selection identity
+  // is independently checked against workspace.selection by useLiveMarketData.
+  nonEmptyString(underlying.symbol, "contract.underlying.symbol");
   nonEmptyString(
     underlying.security_id,
     "contract.underlying.security_id",
@@ -831,7 +824,7 @@ function parseLeg(args: {
       value.open_interest,
       `${path}.open_interest`,
     ),
-    changeOpenInterest: integerValue(
+    changeOpenInterest: optionalIntegerValue(
       value.change_open_interest,
       `${path}.change_open_interest`,
     ),
@@ -1216,6 +1209,11 @@ function finiteNumber(value: unknown, path: string): number {
   return value;
 }
 
+function optionalFiniteNumber(value: unknown, path: string): number | null {
+  if (value === null) return null;
+  return finiteNumber(value, path);
+}
+
 function positiveNumber(value: unknown, path: string): number {
   const selected = finiteNumber(value, path);
   if (selected <= 0) fail("INVALID_FIELD", path, "expected a positive number");
@@ -1255,6 +1253,11 @@ function integerValue(value: unknown, path: string): number {
     fail("INVALID_FIELD", path, "expected a safe integer");
   }
   return selected;
+}
+
+function optionalIntegerValue(value: unknown, path: string): number | null {
+  if (value === null) return null;
+  return integerValue(value, path);
 }
 
 function positiveInteger(value: unknown, path: string): number {

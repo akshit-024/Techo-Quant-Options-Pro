@@ -182,7 +182,7 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
     expect(selected).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("shows the best and second-best contracts ahead of the full ranking", async () => {
+  it("shows the best and second-best contracts with the full ten-leg ranking", async () => {
     const user = userEvent.setup();
     const defaultSnapshot = buildDemoSnapshot({
       market: "NIFTY",
@@ -208,26 +208,11 @@ describe("Sprint 3 and Sprint 4 application workflows", () => {
         name: `${defaultSnapshot.selection.symbol} strike ranking`,
       }),
     );
-    const rankingScope = within(rankingSection).getByRole("group", {
-      name: `Ranking scope for ${defaultSnapshot.selection.symbol} ${defaultSnapshot.selection.expiry}`,
-    });
-    const topFiveButton = within(rankingScope).getByRole("button", {
-      name: "Top 5",
-    });
-    const allButton = within(rankingScope).getByRole("button", {
-      name: "All 10",
-    });
     expect(within(rankingSection).getByText("DEMO snapshot")).toBeInTheDocument();
-    expect(topFiveButton).toHaveAttribute("aria-pressed", "true");
-    expect(allButton).toHaveAttribute("aria-pressed", "false");
-    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(5);
+    expect(within(rankingSection).getByText("10 option legs")).toBeInTheDocument();
+    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(10);
     expect(within(rankingSection).getByText("BEST")).toBeInTheDocument();
     expect(within(rankingSection).getByText("SECOND")).toBeInTheDocument();
-
-    await user.click(allButton);
-    expect(topFiveButton).toHaveAttribute("aria-pressed", "false");
-    expect(allButton).toHaveAttribute("aria-pressed", "true");
-    expect(rankingSection.querySelectorAll("tbody tr")).toHaveLength(10);
 
     await user.click(secondButton);
     const selectedCard = screen.getByText("INSPECTING").closest("article");

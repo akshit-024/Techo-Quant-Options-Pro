@@ -198,7 +198,7 @@ export function DashboardView({
           </span>
           <strong>{formatNumber(analytics.pcr)}</strong>
           <small>
-            Change-OI {formatNumber(analytics.changeOiPcr)}
+            Change-OI {analytics.changeOiPcr === null ? "—" : formatNumber(analytics.changeOiPcr)}
           </small>
         </article>
 

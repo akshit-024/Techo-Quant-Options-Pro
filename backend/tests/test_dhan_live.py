@@ -225,7 +225,7 @@ class DhanLiveFeedTests(unittest.TestCase):
         self.assertEqual(health.ready_instruments, 0)
         self.assertEqual(health.packets_received, 0)
 
-    def test_primary_packets_reject_missing_zero_stale_future_and_replayed_epochs(
+    def test_primary_packets_require_valid_ltt_but_receipt_time_drives_readiness(
         self,
     ) -> None:
         socket = FakeSocket()
@@ -252,9 +252,9 @@ class DhanLiveFeedTests(unittest.TestCase):
             socket.push(b"synthetic missing-epoch packet")
             wait_for(lambda: supervisor.health_snapshot().packets_rejected == 1)
 
-        socket.push(
-            full_packet(segment_code=2, security_id=50001, trade_epoch=0)
-        )
+        socket.push(full_packet(segment_code=2, security_id=50001, trade_epoch=0))
+        wait_for(lambda: supervisor.health_snapshot().packets_rejected == 2)
+
         socket.push(
             full_packet(
                 segment_code=2,
@@ -262,6 +262,9 @@ class DhanLiveFeedTests(unittest.TestCase):
                 trade_epoch=int((FEED_NOW - timedelta(seconds=1)).timestamp()),
             )
         )
+        wait_for(lambda: len(consumed) == 1)
+        self.assertTrue(supervisor.health_snapshot().healthy)
+
         socket.push(
             full_packet(
                 segment_code=2,
@@ -269,25 +272,22 @@ class DhanLiveFeedTests(unittest.TestCase):
                 trade_epoch=int((FEED_NOW + timedelta(seconds=3)).timestamp()),
             )
         )
-        wait_for(lambda: supervisor.health_snapshot().packets_rejected == 4)
-        self.assertEqual(consumed, [])
-        self.assertFalse(supervisor.health_snapshot().healthy)
+        wait_for(lambda: len(consumed) == 2)
 
         valid = full_packet(segment_code=2, security_id=50001)
         socket.push(valid)
-        wait_for(lambda: supervisor.health_snapshot().healthy)
         socket.push(valid)
-        wait_for(lambda: supervisor.health_snapshot().packets_rejected == 5)
+        wait_for(lambda: len(consumed) == 4)
 
         health = supervisor.health_snapshot()
         self.assertTrue(health.healthy)
-        self.assertEqual(len(consumed), 1)
-        self.assertEqual(health.trade_timestamp_rejections, 5)
-        self.assertEqual(health.replayed_packets, 1)
-        self.assertEqual(health.last_trade_at, FEED_NOW)
-        self.assertEqual(health.trade_age_seconds, 0.0)
+        self.assertEqual(health.packets_rejected, 2)
+        self.assertEqual(health.trade_timestamp_rejections, 2)
+        self.assertGreaterEqual(health.replayed_packets, 1)
+        self.assertEqual(health.last_trade_at, FEED_NOW - timedelta(seconds=1))
+        self.assertEqual(health.trade_age_seconds, 1.0)
 
-    def test_trade_time_is_rechecked_while_reporting_readiness(self) -> None:
+    def test_wall_clock_ltt_age_does_not_invalidate_recent_packet_readiness(self) -> None:
         socket = FakeSocket()
         wall_time = [FEED_NOW]
         supervisor = self.supervisor(
@@ -302,8 +302,8 @@ class DhanLiveFeedTests(unittest.TestCase):
 
         wall_time[0] = FEED_NOW + timedelta(seconds=1)
         health = supervisor.health_snapshot()
-        self.assertFalse(health.healthy)
-        self.assertEqual(health.ready_instruments, 0)
+        self.assertTrue(health.healthy)
+        self.assertEqual(health.ready_instruments, 1)
         self.assertEqual(health.trade_age_seconds, 1.0)
 
     def test_subscription_batches_are_replayed_after_transport_reconnect(self) -> None:

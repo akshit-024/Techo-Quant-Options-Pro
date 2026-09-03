@@ -1099,6 +1099,15 @@ class DhanAcquisitionService:
             context=context,
             previous_snapshot=previous,
         )
+        # Preserve exact Dhan master identity while carrying the canonical
+        # application selection symbol separately for API/UI lookup.
+        snapshot = replace(
+            snapshot,
+            metadata={
+                **dict(snapshot.metadata),
+                "selection_symbol": selected.symbol,
+            },
+        )
         ingestion = self._ingestion.ingest(snapshot, now=received_at)
         analysis: SignalPipelineResult | None = None
         try:

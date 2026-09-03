@@ -99,7 +99,7 @@ export function OptionChainTable({
                       <td><Validation leg={row.call} /></td>
                       <td>{formatNumber(row.call.liquidityScore, 1)}</td>
                       <td>{formatNumber(row.call.iv, 1)}%</td>
-                      <td className={row.call.changeOpenInterest >= 0 ? "positive-number" : "negative-number"}>{signed(row.call.changeOpenInterest, "")}</td>
+                      <td className={row.call.changeOpenInterest === null ? "" : row.call.changeOpenInterest >= 0 ? "positive-number" : "negative-number"}>{row.call.changeOpenInterest === null ? "—" : signed(row.call.changeOpenInterest, "")}</td>
                       <td>{formatCompact(row.call.openInterest)}</td>
                       <td>{formatCompact(row.call.volume)}</td>
                     </> : <td>{formatNumber(row.call.liquidityScore, 1)}</td>}
@@ -113,7 +113,7 @@ export function OptionChainTable({
                     {pro ? <>
                       <td>{formatCompact(row.put.volume)}</td>
                       <td>{formatCompact(row.put.openInterest)}</td>
-                      <td className={row.put.changeOpenInterest >= 0 ? "positive-number" : "negative-number"}>{signed(row.put.changeOpenInterest, "")}</td>
+                      <td className={row.put.changeOpenInterest === null ? "" : row.put.changeOpenInterest >= 0 ? "positive-number" : "negative-number"}>{row.put.changeOpenInterest === null ? "—" : signed(row.put.changeOpenInterest, "")}</td>
                       <td>{formatNumber(row.put.iv, 1)}%</td>
                       <td>{formatNumber(row.put.liquidityScore, 1)}</td>
                       <td><Validation leg={row.put} /></td>

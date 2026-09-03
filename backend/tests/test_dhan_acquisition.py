@@ -267,7 +267,7 @@ class DhanAcquisitionTests(unittest.TestCase):
         self.assertEqual(client.history_calls, 1)
         self.assertEqual(client.chain_calls, 2)
         self.assertEqual(len(subscriptions), 2)
-        self.assertEqual(len(subscriptions[0]), 12)
+        self.assertEqual(len(subscriptions[0]), 11)
         self.assertEqual(subscriptions[0], subscriptions[1])
 
     def test_subscription_callback_failure_is_retried_until_success(self) -> None:
@@ -328,7 +328,7 @@ class DhanAcquisitionTests(unittest.TestCase):
         self.assertEqual(contract_deliveries, [])
         self.assertIsNone(service.health_snapshot()["callback_error_code"])
 
-    def test_partial_resolution_keeps_exact_last_complete_subscription_generation(self) -> None:
+    def test_partial_resolution_keeps_complete_active_subscription_generation(self) -> None:
         client = PartialAfterBaselineClient(self.clock)
         deliveries = []
         service = DhanAcquisitionService(
@@ -346,13 +346,35 @@ class DhanAcquisitionTests(unittest.TestCase):
         complete_generation = service.subscriptions_snapshot()
         self.clock.advance(24 * 60 * 60)
         service.run_once(now=self.clock.value)
+        current_generation = service.subscriptions_snapshot()
 
-        self.assertEqual(len(complete_generation), 24)
-        self.assertEqual(service.subscriptions_snapshot(), complete_generation)
-        self.assertEqual(deliveries, [complete_generation, complete_generation])
+        self.assertEqual(len(complete_generation), 23)
+        self.assertEqual(len(current_generation), 23)
+        self.assertEqual(deliveries[0], complete_generation)
+        self.assertEqual(deliveries[-1], current_generation)
+
+        current_security_ids = {
+            security_id for _, security_id in current_generation
+        }
+
+        # NIFTY refreshed successfully from the new master generation.
         self.assertTrue(
-            {str(value) for value in range(30_000, 30_010)}.isdisjoint(
-                security_id for _, security_id in service.subscriptions_snapshot()
+            {str(value) for value in range(30_000, 30_010)}.issubset(
+                current_security_ids
+            )
+        )
+
+        # The obsolete NIFTY option IDs must no longer remain subscribed.
+        self.assertTrue(
+            {str(value) for value in range(10_000, 10_010)}.isdisjoint(
+                current_security_ids
+            )
+        )
+
+        # TCS remains represented by its last verified/fallback contract.
+        self.assertTrue(
+            {str(value) for value in range(11_000, 11_010)}.issubset(
+                current_security_ids
             )
         )
 
@@ -394,7 +416,7 @@ class DhanAcquisitionTests(unittest.TestCase):
         self.assertFalse(result.markets[0].success)
         self.assertEqual(result.markets[0].error_code, "NORMALIZATIONERROR")
         self.assertEqual(client.history_calls, 1)
-        self.assertEqual(client.quote_calls, 0)
+        self.assertEqual(client.quote_calls, 1)
         self.assertEqual(self.repository.ingestion_attempt_count(), 0)
 
     def test_one_bucket_lagging_history_fails_closed(self) -> None:
@@ -405,7 +427,7 @@ class DhanAcquisitionTests(unittest.TestCase):
 
         self.assertFalse(result.markets[0].success)
         self.assertEqual(result.markets[0].error_code, "NORMALIZATIONERROR")
-        self.assertEqual(client.quote_calls, 0)
+        self.assertEqual(client.quote_calls, 1)
 
     def test_after_hours_cannot_re_stamp_a_cached_close_candle(self) -> None:
         self.clock.value = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
@@ -455,10 +477,9 @@ class DhanAcquisitionTests(unittest.TestCase):
         self.assertIsNone(market_health["last_success_at"])
         self.assertEqual(market_health["error_code"], "SNAPSHOT_REJECTED")
 
-    def test_provider_trade_time_drives_market_freshness_not_http_receipt(self) -> None:
+    def test_http_receipt_time_drives_quote_observation_freshness(self) -> None:
         client = ProviderTimestampClient(self.clock, trade_lag=timedelta(seconds=1))
         service = self.service(client)
-        provider_time = (self.clock.value - timedelta(seconds=1)).astimezone(IST)
 
         result = service.run_once(now=self.clock.value)
         workspace = self.read_models.workspace("NIFTY", "NIFTY", now=self.clock.value)
@@ -466,7 +487,7 @@ class DhanAcquisitionTests(unittest.TestCase):
         self.assertTrue(result.markets[0].data_success)
         self.assertIsNotNone(workspace)
         assert workspace is not None
-        self.assertEqual(workspace["market"]["observed_at"], provider_time.isoformat())
+        self.assertEqual(workspace["market"]["observed_at"], self.clock.value.isoformat())
         self.assertEqual(client.quote_calls, 1)
 
     def test_one_symbol_failure_does_not_block_another_market(self) -> None:

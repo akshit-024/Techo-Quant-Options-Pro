@@ -260,7 +260,7 @@ class MarketReadModelStoreTests(unittest.TestCase):
         second_known = replace(packet, security_id="10001")
         self.assertFalse(store.publish_feed_tick(second_known))
 
-    def test_primary_feed_ticks_require_fresh_monotonic_trade_epochs(self) -> None:
+    def test_primary_feed_ticks_require_valid_ltt_and_monotonic_receipt_time(self) -> None:
         snapshot = live_snapshot()
         check_time = NOW + timedelta(seconds=1)
         store = MarketReadModelStore(clock=lambda: check_time)
@@ -279,46 +279,36 @@ class MarketReadModelStoreTests(unittest.TestCase):
         )
 
         missing = replace(base, fields={"last_price": 201.5})
-        zero = replace(
-            base,
-            fields={**base.fields, "last_trade_epoch": 0},
-        )
-        stale = replace(
+        zero = replace(base, fields={**base.fields, "last_trade_epoch": 0})
+        self.assertFalse(store.publish_feed_tick(missing, received_at=check_time))
+        self.assertFalse(store.publish_feed_tick(zero, received_at=check_time))
+        self.assertEqual(store.revision, 1)
+        self.assertIsNone(store.latest_feed_tick("10000", now=check_time))
+
+        stale_ltt = replace(
             base,
             fields={
                 **base.fields,
                 "last_trade_epoch": int((NOW - timedelta(seconds=31)).timestamp()),
             },
         )
-        future = replace(
+        self.assertTrue(store.publish_feed_tick(stale_ltt, received_at=check_time))
+        self.assertFalse(store.publish_feed_tick(base, received_at=check_time))
+
+        next_receipt = check_time + timedelta(milliseconds=1)
+        future_ltt = replace(
             base,
             fields={
                 **base.fields,
                 "last_trade_epoch": int((check_time + timedelta(seconds=3)).timestamp()),
             },
         )
-        for packet in (missing, zero, stale, future):
-            with self.subTest(fields=packet.fields):
-                self.assertFalse(store.publish_feed_tick(packet))
-        self.assertEqual(store.revision, 1)
-        self.assertIsNone(store.latest_feed_tick("10000"))
+        self.assertTrue(store.publish_feed_tick(future_ltt, received_at=next_receipt))
+        self.assertEqual(store.revision, 3)
 
-        self.assertTrue(store.publish_feed_tick(base))
-        self.assertFalse(store.publish_feed_tick(base))
-        older = replace(
-            base,
-            fields={
-                **base.fields,
-                "last_trade_epoch": int((NOW - timedelta(seconds=1)).timestamp()),
-            },
-        )
-        self.assertFalse(store.publish_feed_tick(older))
-        self.assertEqual(store.revision, 2)
-
-        result = store.latest_feed_tick("10000")
+        result = store.latest_feed_tick("10000", now=next_receipt)
         assert result is not None
-        self.assertEqual(result["observed_at"], NOW.isoformat())
+        self.assertEqual(result["observed_at"], next_receipt.isoformat())
+        self.assertTrue(result["fresh"])
+        self.assertFalse(result["actionable"])
 
-
-if __name__ == "__main__":
-    unittest.main()

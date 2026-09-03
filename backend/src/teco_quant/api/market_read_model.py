@@ -283,12 +283,11 @@ class MarketReadModelStore:
         check_time = self._check_time(received_at)
         primary_price = packet.response_code in {2, 4, 8}
         trade_time = _feed_observed_at(packet) if primary_price else None
-        if primary_price:
-            if trade_time is None:
-                return False
-            # Dhan LTT is last-trade telemetry, not the timestamp of this
-            # current quote/depth update. Freshness for this explicitly non-actionable
-            # cache is governed by validated local packet receipt time below.
+        if primary_price and trade_time is None:
+            return False
+        # Dhan LTT is last-trade telemetry, not the timestamp of this
+        # current quote/depth update. Freshness for this explicitly non-actionable
+        # cache is governed by validated local packet receipt time below.
         depth = tuple(_feed_depth_payload(level) for level in packet.depth)
 
         with self._lock:
@@ -575,6 +574,7 @@ class MarketReadModelStore:
     ) -> JsonObject:
         snapshot = publication.snapshot
         static_blockers = _static_blockers(publication)
+        decision_blockers = _decision_blockers(publication)
         dynamic_blockers, oldest_age, newest_age = _dynamic_blockers(
             snapshot,
             now,
@@ -613,6 +613,7 @@ class MarketReadModelStore:
             decision = analysis.decision.value
         actionable = bool(
             operational
+            and not decision_blockers
             and analysis is not None
             and analysis.decision in _ACTIONABLE_DECISIONS
             and analysis.trade_plan is not None
@@ -632,6 +633,7 @@ class MarketReadModelStore:
             "actionable": actionable,
             "operational_decision": decision,
             "blockers": list(blockers),
+            "decision_blockers": list(decision_blockers),
             "warnings": [issue.code for issue in publication.report.warnings],
             "freshness": {
                 "evaluated_at": now.isoformat(),
@@ -656,7 +658,11 @@ class MarketReadModelStore:
 
 
 def _selection_key(snapshot: AtomicSnapshot) -> _SelectionKey:
-    symbol = _required_identifier(snapshot.contract.underlying.symbol, name="contract symbol")
+    raw_symbol = snapshot.metadata.get("selection_symbol")
+    symbol = _required_identifier(
+        raw_symbol if isinstance(raw_symbol, str) else snapshot.contract.underlying.symbol,
+        name="selection symbol",
+    )
     return _SelectionKey(
         market_id=_market_id(snapshot),
         symbol=symbol,
@@ -927,6 +933,7 @@ def _validation_payload(report: ValidationReport) -> JsonObject:
 
 
 def _static_blockers(publication: _PublishedSnapshot) -> tuple[str, ...]:
+    # These blockers determine whether the live workspace itself is safe to display.
     snapshot = publication.snapshot
     blockers = [issue.code for issue in publication.report.errors]
     underlying = snapshot.market.pricing_underlying(snapshot.contract.market_kind)
@@ -934,10 +941,19 @@ def _static_blockers(publication: _PublishedSnapshot) -> tuple[str, ...]:
         blockers.append("MARKET_PRICE_UNAVAILABLE")
     if not _five_strike_chain_complete(snapshot):
         blockers.append("OPTION_CHAIN_INCOMPLETE")
-    if any(
-        quote.change_open_interest is None
-        for quote in snapshot.option_chain
-    ):
+    analysis = publication.analysis
+    if analysis is None:
+        blockers.append("ANALYTICS_UNAVAILABLE")
+    elif len(analysis.ranked_strikes) != len(snapshot.option_chain):
+        blockers.append("STRIKE_RANKING_UNAVAILABLE")
+    return tuple(dict.fromkeys(blockers))
+
+
+def _decision_blockers(publication: _PublishedSnapshot) -> tuple[str, ...]:
+    # Trade-decision gaps must not hide an otherwise valid live Dhan workspace.
+    snapshot = publication.snapshot
+    blockers: list[str] = []
+    if any(quote.change_open_interest is None for quote in snapshot.option_chain):
         blockers.append("CHAIN_CHANGE_OI_UNAVAILABLE")
     analysis = publication.analysis
     if analysis is None:

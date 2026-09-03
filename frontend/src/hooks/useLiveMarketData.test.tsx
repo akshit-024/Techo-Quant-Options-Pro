@@ -180,7 +180,7 @@ describe("useLiveMarketData", () => {
     expect(result.current.error).toMatch(/Dhan credentials/i);
   });
 
-  it("publishes the catalog when an expired startup selection is unavailable", async () => {
+  it("publishes the catalog and still attempts the requested workspace for an expired startup selection", async () => {
     const fetchMock = routeFetch({
       "/status": STATUS,
       "/markets": CATALOG,
@@ -201,6 +201,7 @@ describe("useLiveMarketData", () => {
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       "/status",
       "/markets",
+      "/market/workspace",
     ]);
   });
 
