@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: teco-quant-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -e .
+    startCommand: python -m teco_quant serve --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TECO_DHAN_LIVE_ENABLED
+        value: "true"
+
+      - key: TECO_EXECUTION_MODE
+        value: DATA_ONLY
+
+      - key: DHAN_CLIENT_ID
+        sync: false
+
+      - key: DHAN_ACCESS_TOKEN
+        sync: false
+
+      - key: TECO_ALLOWED_ORIGINS
+        sync: false
+
+  - type: web
+    name: teco-quant-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
