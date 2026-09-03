@@ -12,6 +12,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
+from math import isfinite
 from threading import Lock, RLock
 from typing import Protocol
 
@@ -22,11 +23,13 @@ from teco_quant.brokers import (
     DhanLiveFeedSupervisor,
 )
 from teco_quant.brokers.dhan import DhanCredentials
+from teco_quant.domain.enums import MarketKind
 from teco_quant.domain.models import ContractSpec, StrategyContext
 from teco_quant.ingestion.dhan_acquisition import (
     ExplicitStrategyInputs,
     build_dhan_acquisition_service,
 )
+from teco_quant.ingestion.dhan_catalog import SUPPORTED_UNIVERSE
 from teco_quant.ingestion.dhan_historical import CompletedTechnicalResult
 from teco_quant.ingestion.service import SnapshotIngestionService
 from teco_quant.ingestion.validation import SnapshotValidator
@@ -193,6 +196,34 @@ class BackendMarketDataService:
             )
             return started
 
+    def request_focus(
+        self,
+        market_id: str,
+        symbol: str,
+        expiry: str | None = None,
+    ) -> None:
+        """Prioritize the exact workspace being requested by the live frontend."""
+
+        del expiry
+        selected_market = str(market_id).strip().upper()
+        selected_symbol = str(symbol).strip().upper()
+        definition = SUPPORTED_UNIVERSE.get(selected_symbol)
+        if definition is None:
+            raise ValueError("focused symbol is not in the supported universe")
+        expected_market = (
+            "MCX"
+            if definition.market_kind is MarketKind.COMMODITY
+            else "STOCK_FNO"
+            if definition.market_kind is MarketKind.STOCK
+            else definition.symbol
+        )
+        if selected_market != expected_market:
+            raise ValueError("focused market and symbol do not describe one workspace")
+
+        requester = getattr(self._acquisition, "request_focus", None)
+        if callable(requester):
+            requester(selected_symbol)
+
     def stop(self) -> None:
         """Stop REST acquisition then the socket; report incomplete worker shutdown."""
 
@@ -268,15 +299,25 @@ class BackendMarketDataService:
             acquisition.get("decision_inputs_configured") is True
         )
         transport_healthy = socket.get("healthy") is True
-        successful_data = acquisition.get(
-            "data_successful_markets",
-            acquisition.get("successful_markets"),
-        )
+        markets = acquisition.get("markets")
+        fresh_data_markets = 0
+        if isinstance(markets, Mapping):
+            for market_health in markets.values():
+                if not isinstance(market_health, Mapping):
+                    continue
+                age = market_health.get("data_age_seconds")
+                if (
+                    market_health.get("accepted") is True
+                    and market_health.get("error_code") is None
+                    and isinstance(age, (int, float))
+                    and not isinstance(age, bool)
+                    and isfinite(float(age))
+                    and 0 <= float(age) <= self._settings.live_max_age_seconds
+                ):
+                    fresh_data_markets += 1
         data_healthy = bool(
             lifecycle in {"RUNNING", "PARTIAL"}
-            and isinstance(successful_data, int)
-            and not isinstance(successful_data, bool)
-            and successful_data > 0
+            and fresh_data_markets > 0
         )
 
         result: dict[str, object] = {
@@ -288,6 +329,7 @@ class BackendMarketDataService:
             "connected": socket.get("connected") is True,
             "transport_healthy": transport_healthy,
             "data_healthy": data_healthy,
+            "fresh_data_markets": fresh_data_markets,
             "healthy": data_healthy and transport_healthy,
             "decision_inputs_configured": decision_inputs_configured,
             "actionable_ready": (
@@ -303,10 +345,12 @@ class BackendMarketDataService:
             "last_success_at",
             "master_error_code",
             "callback_error_code",
+            "focused_symbol",
         ):
             result[name] = acquisition.get(name)
         for name in (
             "subscriptions_count",
+            "attempted_markets",
             "successful_markets",
             "accepted_markets",
             "published_markets",
@@ -343,7 +387,6 @@ class BackendMarketDataService:
         ):
             if name in socket:
                 result[name] = socket[name]
-        markets = acquisition.get("markets")
         if isinstance(markets, Mapping):
             result["markets"] = markets
         return result
@@ -484,11 +527,7 @@ class BackendMarketDataService:
             try:
                 future = contract.futures
                 if future is not None:
-                    required = (
-                        (
-                            contract.underlying.segment,
-                            contract.underlying.security_id,
-                        ),
+                    required_items = [
                         (
                             future.instrument.segment,
                             future.instrument.security_id,
@@ -500,7 +539,16 @@ class BackendMarketDataService:
                             )
                             for record in contract.option_contracts
                         ),
-                    )
+                    ]
+                    if contract.market_kind is not MarketKind.INDEX:
+                        required_items.insert(
+                            0,
+                            (
+                                contract.underlying.segment,
+                                contract.underlying.security_id,
+                            ),
+                        )
+                    required = tuple(required_items)
                     checker = getattr(feed, "instruments_healthy", None)
                     if callable(checker):
                         healthy = checker(required) is True
@@ -545,6 +593,7 @@ def attach_dhan_market_data(
         integration.stop()
         raise
     runtime.application.feed_health = integration.health_snapshot
+    runtime.application.market_focus = integration.request_focus
     integration.start()
     return integration
 

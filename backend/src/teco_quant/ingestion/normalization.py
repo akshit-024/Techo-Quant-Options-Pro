@@ -542,12 +542,13 @@ def _dhan_quote_timestamp(
         raise NormalizationError(
             "Dhan quote last_trade_time must use DD/MM/YYYY HH:MM:SS IST"
         )
-    age = received_at.astimezone(UTC) - parsed.astimezone(UTC)
-    if age > maximum_trade_age:
-        raise NormalizationError("Dhan quote last_trade_time is stale or a sentinel")
-    if age < -maximum_future_skew:
-        raise NormalizationError("Dhan quote last_trade_time is future-dated")
-    return parsed, None
+    # Dhan documents this field as LAST TRADE time. It is not the observation
+    # timestamp of the current REST quote response, so age/future-skew checks on LTT
+    # can reject valid current quotes for illiquid or provider-clock-shifted contracts.
+    # Keep strict provider-format validation, but use authenticated HTTP receipt time
+    # as the observation timestamp for the current quote snapshot.
+    del parsed, maximum_trade_age, maximum_future_skew
+    return received_at, None
 
 
 @dataclass(frozen=True, slots=True)

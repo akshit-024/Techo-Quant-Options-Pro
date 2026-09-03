@@ -229,21 +229,21 @@ async function runMarketLoop({
       // newly rolled expiry. A partial catalog must never terminate the refresh loop.
       setState((current) => ({ ...current, catalog, revision }));
 
-      if (catalog.markets.length === 0) {
-        setState((current) => ({
-          ...current,
-          connection: current.workspace === null ? "EMPTY" : "STALE",
-          catalog,
-          isLoading: false,
-          stale: current.workspace !== null,
-          error: "The backend has not published any validated market workspace yet.",
-          revision,
-        }));
-        await abortableDelay(retryDelayMs, controller.signal);
-        continue;
-      }
-
       if (selection === null) {
+        if (catalog.markets.length === 0) {
+          setState((current) => ({
+            ...current,
+            connection: "EMPTY",
+            catalog,
+            workspace: null,
+            isLoading: false,
+            stale: false,
+            error: "The backend has not published any validated market workspace yet.",
+            revision,
+          }));
+          await abortableDelay(retryDelayMs, controller.signal);
+          continue;
+        }
         setState((current) => ({
           ...current,
           connection: "LIVE",
@@ -254,19 +254,9 @@ async function runMarketLoop({
           error: null,
           revision,
         }));
-      } else if (!catalogContainsSelection(catalog, selection)) {
-        setState((current) => ({
-          ...current,
-          connection: current.workspace === null ? "EMPTY" : "STALE",
-          catalog,
-          isLoading: false,
-          stale: current.workspace !== null,
-          error: `${selection.symbol} ${selection.expiry.slice(0, 10)} has not published a validated workspace yet.`,
-          revision,
-        }));
-        await abortableDelay(retryDelayMs, controller.signal);
-        continue;
       } else {
+        // Always ask for the selected workspace, even before it appears in /markets.
+        // The backend uses this read request as an idempotent acquisition-priority hint.
         const workspace = await loadWorkspace({ ...request, selection });
         if (controller.signal.aborted) return;
         if (!selectionsEqual(workspace.selection, selection)) {
@@ -299,7 +289,18 @@ async function runMarketLoop({
       await abortableDelay(Math.min(retryDelayMs, 1_000), controller.signal);
     } catch (error) {
       if (controller.signal.aborted || isCancelled(error)) return;
-      publishFailure(setState, error, revision);
+      if (selection !== null && isSelectionPending(error)) {
+        setState((current) => ({
+          ...current,
+          connection: current.workspace === null ? "LOADING" : "STALE",
+          isLoading: current.workspace === null,
+          stale: current.workspace !== null,
+          error: `${selection.symbol} ${selection.expiry.slice(0, 10)} is being acquired from the live backend.`,
+          revision,
+        }));
+      } else {
+        publishFailure(setState, error, revision);
+      }
       await abortableDelay(retryDelayMs, controller.signal);
     }
   }
@@ -417,18 +418,11 @@ function selectionsEqual(
   );
 }
 
-function catalogContainsSelection(
-  catalog: MarketCatalogResponse,
-  selection: MarketSelection,
-): boolean {
-  return catalog.markets.some(
-    (market) =>
-      market.market_id === selection.market_id &&
-      market.symbols.some(
-        (candidate) =>
-          candidate.symbol === selection.symbol &&
-          candidate.expiries.includes(selection.expiry),
-      ),
+function isSelectionPending(error: unknown): boolean {
+  return (
+    error instanceof BackendApiError &&
+    error.code === "HTTP_ERROR" &&
+    error.status === 404
   );
 }
 

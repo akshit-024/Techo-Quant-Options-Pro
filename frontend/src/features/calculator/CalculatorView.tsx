@@ -34,6 +34,7 @@ export function CalculatorView({
       <InputsPanel inputs={snapshot.inputs} presentationMode={presentationMode} onOverride={onOverride} />
       <OptionChainTable
         chain={snapshot.chain}
+        dataMode={snapshot.dataMode}
         onLegSelect={onLegSelect}
         presentationMode={presentationMode}
         selectedLegKey={selectedLegKey}

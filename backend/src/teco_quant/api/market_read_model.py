@@ -282,17 +282,13 @@ class MarketReadModelStore:
             return False
         check_time = self._check_time(received_at)
         primary_price = packet.response_code in {2, 4, 8}
-        observed_at = _feed_observed_at(packet) if primary_price else None
+        trade_time = _feed_observed_at(packet) if primary_price else None
         if primary_price:
-            if observed_at is None:
+            if trade_time is None:
                 return False
-            observed_age = (check_time - observed_at).total_seconds()
-            if not (
-                -self._strategy.future_clock_skew_seconds
-                <= observed_age
-                <= self._strategy.live_max_age_seconds
-            ):
-                return False
+            # Dhan LTT is last-trade telemetry, not the timestamp of this
+            # current quote/depth update. Freshness for this explicitly non-actionable
+            # cache is governed by validated local packet receipt time below.
         depth = tuple(_feed_depth_payload(level) for level in packet.depth)
 
         with self._lock:
@@ -302,10 +298,12 @@ class MarketReadModelStore:
                 return False
             current = self._ticks.get(packet.security_id)
             if primary_price:
-                assert observed_at is not None
-                if current is not None and observed_at <= current.observed_at:
+                # The tick cache is explicitly non-actionable. Its market-data freshness
+                # represents when this validated quote packet reached us, while the raw
+                # last_trade_epoch remains preserved in fields for audit/telemetry.
+                if current is not None and check_time <= current.observed_at:
                     return False
-                selected_observed_at = observed_at
+                selected_observed_at = check_time
             else:
                 # OI/previous-close packets don't contain a trade epoch.  They may enrich
                 # an existing price tick but can neither create one nor refresh its market

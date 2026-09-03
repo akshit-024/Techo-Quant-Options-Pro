@@ -131,7 +131,13 @@ export function DashboardView({
         </div>
 
         <div className="decision-hero__leader">
-          <span>TOP ELIGIBLE LEG</span>
+          <span>
+            {snapshot.dataMode === "STALE"
+              ? "LAST RANKED LEG"
+              : snapshot.dataMode === "DEMO"
+                ? "DEMO TOP LEG"
+                : "TOP ELIGIBLE LEG"}
+          </span>
 
           {best === null ? (
             <>
@@ -148,7 +154,8 @@ export function DashboardView({
               </div>
 
               <p>
-                Entry reference <strong>{formatPrice(best.askEntry)}</strong> ask
+                {snapshot.dataMode === "STALE" ? "Last ask reference" : "Entry reference"}{" "}
+                <strong>{formatPrice(best.askEntry)}</strong> ask
               </p>
 
               <button
@@ -261,6 +268,7 @@ export function DashboardView({
 
       <OptionChainTable
         chain={snapshot.chain}
+        dataMode={snapshot.dataMode}
         compact
         onLegSelect={onLegSelect}
         presentationMode="QUICK"

@@ -816,28 +816,15 @@ class DhanLiveFeedSupervisor:
         trade_time: datetime | None = None
         if packet.response_code in _PRIMARY_PRICE_RESPONSE_CODES:
             trade_timestamp = _positive_trade_timestamp(packet)
-            if trade_timestamp is not None:
-                trade_epoch, trade_time = trade_timestamp
-                trade_age = (wall_time - trade_time).total_seconds()
-                if not (
-                    -self._config.future_skew_seconds
-                    <= trade_age
-                    <= self._config.data_stale_seconds
-                ):
-                    trade_timestamp = None
-            with self._lock:
-                previous_epoch = self._last_trade_epoch_by_key.get(key)
-                replayed = (
-                    trade_epoch is not None
-                    and previous_epoch is not None
-                    and trade_epoch <= previous_epoch
-                )
-                if trade_timestamp is None or replayed:
+            if trade_timestamp is None:
+                with self._lock:
                     self._packets_rejected += 1
                     self._trade_timestamp_rejections += 1
-                    if replayed:
-                        self._replayed_packets += 1
-                    return
+                return
+            # Dhan LTT is the exchange's last executed trade time, not the
+            # timestamp of this current quote/depth packet. Provider LTT can be old,
+            # repeated, or clock-shifted without making the current packet stale.
+            trade_epoch, trade_time = trade_timestamp
         try:
             accepted = self._on_packet(packet)
         except Exception:  # noqa: BLE001 - callback errors are deliberately sanitized
@@ -855,14 +842,23 @@ class DhanLiveFeedSupervisor:
             self._last_packet_at = wall_time
             self._last_packet_monotonic = received_at
             if trade_epoch is not None and trade_time is not None:
-                self._last_trade_epoch_by_key[key] = trade_epoch
-                self._last_trade_at = trade_time
-            if (
-                trade_epoch is not None
-                and packet.response_code == _primary_response_code(self._mode)
-            ):
+                previous_epoch = self._last_trade_epoch_by_key.get(key)
+                if previous_epoch is None or trade_epoch > previous_epoch:
+                    self._last_trade_epoch_by_key[key] = trade_epoch
+                    if (
+                        (wall_time - trade_time).total_seconds()
+                        >= -self._config.future_skew_seconds
+                    ):
+                        self._last_trade_at = trade_time
+                elif trade_epoch < previous_epoch:
+                    # Preserve out-of-order LTT as telemetry only. A current FULL quote
+                    # packet can legitimately carry an older trade time while still
+                    # containing current depth/OI data.
+                    self._replayed_packets += 1
+            if packet.response_code == _primary_response_code(self._mode):
                 self._ready_at[key] = received_at
-                self._ready_trade_epoch[key] = trade_epoch
+                if trade_epoch is not None:
+                    self._ready_trade_epoch[key] = trade_epoch
             self._refresh_health_locked(received_at, wall_time)
 
     def _accept_market_status(
@@ -914,15 +910,15 @@ class DhanLiveFeedSupervisor:
     def _fresh_ready_keys_locked(
         self, now: float, wall_time: datetime
     ) -> frozenset[tuple[int, str]]:
-        wall_epoch = wall_time.timestamp()
+        del wall_time
+        # FULL/QUOTE packets are real-time quote updates. Their LTT field records the
+        # last executed trade and can legitimately be old for illiquid options. Socket
+        # readiness therefore follows the age of the validated packet receipt, while
+        # malformed or future-dated LTT is rejected earlier in _accept_packet.
         return frozenset(
             key
             for key, received_at in self._ready_at.items()
             if 0 <= now - received_at <= self._config.data_stale_seconds
-            and key in self._ready_trade_epoch
-            and -self._config.future_skew_seconds
-            <= wall_epoch - self._ready_trade_epoch[key]
-            <= self._config.data_stale_seconds
         )
 
     def _record_failure(self, error: Exception) -> None:

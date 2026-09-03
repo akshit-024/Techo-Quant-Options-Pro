@@ -1,10 +1,11 @@
-import type { OptionLeg, OptionStrike } from "../../domain/types";
+import type { MarketSnapshot, OptionLeg, OptionStrike } from "../../domain/types";
 import { formatCompact, formatNumber, formatPrice, signed } from "../../lib/format";
 import { Badge } from "../../components/ui/Badge";
 import { SectionHeader } from "../../components/ui/SectionHeader";
 
 interface OptionChainTableProps {
   chain: readonly OptionStrike[];
+  dataMode: MarketSnapshot["dataMode"];
   selectedLegKey: string;
   presentationMode: "QUICK" | "PRO";
   compact?: boolean;
@@ -47,6 +48,7 @@ function LegScore({ leg, strike, selected, onSelect }: {
 
 export function OptionChainTable({
   chain,
+  dataMode,
   selectedLegKey,
   presentationMode,
   compact = false,
@@ -127,7 +129,13 @@ export function OptionChainTable({
           <span><i className="note-swatch note-swatch--ask" /> Ask = executable entry reference</span>
           <span><i className="note-swatch note-swatch--bid" /> Bid = immediate-exit estimate</span>
           <span><i className="note-swatch note-swatch--atm" /> ATM row</span>
-          <span className="chain-notes__disclaimer">Demo quotes only · LTP is never treated as an executable price</span>
+          <span className="chain-notes__disclaimer">
+            {dataMode === "DEMO"
+              ? "Demo quotes only · LTP is never treated as an executable price"
+              : dataMode === "STALE"
+                ? "Retained stale backend quotes · non-actionable · LTP is not an executable price"
+                : "Validated live backend quotes · ask is the entry reference and bid is the exit reference"}
+          </span>
         </div>
       </div>
     </section>

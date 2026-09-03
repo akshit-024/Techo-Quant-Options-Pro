@@ -142,14 +142,10 @@ class DhanContractFamily:
         tick_size = next(iter(tick_sizes))
         assert lot_size is not None
         assert tick_size is not None
-        # API/workspace selection uses the configured canonical symbol. Dhan's
-        # quoteable equity records can instead expose long legal names (for example,
-        # ``TATA CONSULTANCY SERV LT``). Preserve the verified provider identity and
-        # only canonicalize its presentation/selection symbol.
-        contract_underlying = replace(
-            self.underlying.instrument,
-            symbol=self.definition.symbol,
-        )
+        # ContractSpec is an immutable provider-verified identity and must preserve
+        # the exact underlying record from the Dhan instrument master. Presentation/
+        # selection continues to use ResolvedDhanContract.symbol below.
+        contract_underlying = self.underlying.instrument
         contract = ContractSpec(
             underlying=contract_underlying,
             market_kind=self.definition.market_kind,
@@ -162,16 +158,22 @@ class DhanContractFamily:
             option_contracts=selected,
             futures=self.future,
         )
-        subscriptions = _unique_subscriptions(
-            (
-                (self.underlying.instrument.segment, self.underlying.instrument.security_id),
-                (self.future.instrument.segment, self.future.instrument.security_id),
-                *(
-                    (record.instrument.segment, record.instrument.security_id)
-                    for record in selected
+        subscription_candidates = [
+            (self.future.instrument.segment, self.future.instrument.security_id),
+            *(
+                (record.instrument.segment, record.instrument.security_id)
+                for record in selected
+            ),
+        ]
+        if self.definition.market_kind is not MarketKind.INDEX:
+            subscription_candidates.insert(
+                0,
+                (
+                    self.underlying.instrument.segment,
+                    self.underlying.instrument.security_id,
                 ),
             )
-        )
+        subscriptions = _unique_subscriptions(tuple(subscription_candidates))
         return ResolvedDhanContract(
             symbol=self.definition.symbol,
             contract=contract,

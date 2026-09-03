@@ -274,12 +274,17 @@ class AcquisitionCycleResult:
     def data_successful_markets(self) -> int:
         return sum(result.data_success for result in self.markets)
 
+    @property
+    def attempted_markets(self) -> int:
+        return len(self.markets)
+
     def as_dict(self) -> dict[str, object]:
         return {
             "started_at": self.started_at.isoformat(),
             "completed_at": self.completed_at.isoformat(),
             "configured": self.configured,
             "master_batch_id": self.master_batch_id,
+            "attempted_markets": self.attempted_markets,
             "successful_markets": self.successful_markets,
             "failed_markets": self.failed_markets,
             "accepted_markets": self.accepted_markets,
@@ -318,6 +323,7 @@ class _MarketHealth:
     snapshot_id: str | None = None
     accepted: bool = False
     error_code: str | None = None
+    validation_issues: tuple[str, ...] = ()
 
 
 class DhanAcquisitionService:
@@ -412,6 +418,7 @@ class DhanAcquisitionService:
         self._lock = RLock()
         self._cycle_lock = Lock()
         self._stop_event = Event()
+        self._reschedule_event = Event()
         self._thread: Thread | None = None
         self._catalog: DhanInstrumentCatalog | None = None
         self._catalog_batch: DhanCatalogBatch | None = None
@@ -426,6 +433,9 @@ class DhanAcquisitionService:
         self._contracts: dict[str, ContractSpec] = {}
         self._registries: dict[str, Mapping[str, str]] = {}
         self._market_health = {symbol: _MarketHealth() for symbol in self._symbols}
+        self._focused_symbol: str | None = None
+        self._focus_refresh_pending = False
+        self._background_cursor = 0
         self._lifecycle = (
             AcquisitionLifecycle.DISABLED
             if client is not None
@@ -453,6 +463,7 @@ class DhanAcquisitionService:
             if self._thread is not None and self._thread.is_alive():
                 return False
             self._stop_event.clear()
+            self._reschedule_event.clear()
             self._lifecycle = AcquisitionLifecycle.INITIALIZING
             self._thread = Thread(
                 target=self._worker,
@@ -466,6 +477,7 @@ class DhanAcquisitionService:
         if timeout < 0:
             raise ValueError("stop timeout cannot be negative")
         self._stop_event.set()
+        self._reschedule_event.set()
         with self._lock:
             thread = self._thread
         if thread is not None and thread is not current_thread():
@@ -492,16 +504,60 @@ class DhanAcquisitionService:
             self._client.close()
         return True
 
-    def run_once(self, *, now: datetime | None = None) -> AcquisitionCycleResult:
-        """Run one deterministic, failure-isolated acquisition cycle."""
+    def request_focus(self, symbol: str) -> bool:
+        """Prioritize one configured symbol without starting an extra provider worker."""
+
+        selected = str(symbol).strip().upper()
+        if selected not in self._symbols:
+            raise ValueError(
+                "focused symbol must belong to the configured supported universe"
+            )
+        with self._lock:
+            changed = selected != self._focused_symbol
+            self._focused_symbol = selected
+            if changed:
+                self._focus_refresh_pending = True
+        if changed:
+            # Wake a sleeping worker. If a provider cycle is already in flight, the
+            # event remains set and the newly focused symbol is handled next.
+            self._reschedule_event.set()
+        return changed
+
+    def run_once(
+        self,
+        *,
+        now: datetime | None = None,
+        symbols: Sequence[str] | None = None,
+    ) -> AcquisitionCycleResult:
+        """Run one deterministic, failure-isolated acquisition cycle.
+
+        ``symbols=None`` preserves the full-universe behavior used by diagnostics and
+        deterministic tests. The production worker supplies a bounded priority batch.
+        """
 
         started = self._checked_time(now or self._clock())
+        cycle_symbols = self._normalize_cycle_symbols(symbols)
         if not self._cycle_lock.acquire(blocking=False):
             raise RuntimeError("a Dhan acquisition cycle is already running")
         try:
-            return self._run_once_locked(started)
+            return self._run_once_locked(started, cycle_symbols)
         finally:
             self._cycle_lock.release()
+
+    def _normalize_cycle_symbols(
+        self,
+        symbols: Sequence[str] | None,
+    ) -> tuple[str, ...]:
+        if symbols is None:
+            return self._symbols
+        selected = tuple(
+            dict.fromkeys(str(value).strip().upper() for value in symbols)
+        )
+        if not selected or any(symbol not in self._symbols for symbol in selected):
+            raise ValueError(
+                "cycle symbols must be a non-empty configured-universe subset"
+            )
+        return selected
 
     def health_snapshot(self) -> dict[str, object]:
         """Return a bounded API-safe mapping containing no credentials or raw payloads."""
@@ -520,6 +576,7 @@ class DhanAcquisitionService:
                     "snapshot_id": health.snapshot_id,
                     "accepted": health.accepted,
                     "error_code": health.error_code,
+                    "validation_issues": list(health.validation_issues),
                 }
                 for symbol, health in self._market_health.items()
             }
@@ -542,7 +599,11 @@ class DhanAcquisitionService:
                 "consecutive_failures": self._consecutive_failures,
                 "master_error_code": self._master_error_code,
                 "callback_error_code": self._callback_error_code,
+                "focused_symbol": self._focused_symbol,
                 "subscriptions_count": len(self._subscriptions),
+                "attempted_markets": (
+                    0 if last_cycle is None else last_cycle.attempted_markets
+                ),
                 "successful_markets": (
                     0 if last_cycle is None else last_cycle.successful_markets
                 ),
@@ -571,7 +632,11 @@ class DhanAcquisitionService:
         with self._lock:
             return {symbol: dict(registry) for symbol, registry in self._registries.items()}
 
-    def _run_once_locked(self, started: datetime) -> AcquisitionCycleResult:
+    def _run_once_locked(
+        self,
+        started: datetime,
+        cycle_symbols: tuple[str, ...],
+    ) -> AcquisitionCycleResult:
         with self._lock:
             self._last_cycle_started = started
             # INITIALIZING describes startup, not every refresh. A full sweep can
@@ -589,7 +654,7 @@ class DhanAcquisitionService:
                     published=False,
                     error_code="CONFIG_REQUIRED",
                 )
-                for symbol in self._symbols
+                for symbol in cycle_symbols
             )
             cycle = AcquisitionCycleResult(
                 started_at=started,
@@ -614,8 +679,12 @@ class DhanAcquisitionService:
             catalog = self._catalog
         if catalog is None:
             results = tuple(
-                self._failure(symbol, master_error or RuntimeError("master unavailable"), started)
-                for symbol in self._symbols
+                self._failure(
+                    symbol,
+                    master_error or RuntimeError("master unavailable"),
+                    started,
+                )
+                for symbol in cycle_symbols
             )
             cycle = AcquisitionCycleResult(
                 started_at=started,
@@ -630,7 +699,7 @@ class DhanAcquisitionService:
 
         families: dict[str, Any] = {}
         preflight_failures: dict[str, MarketAcquisitionResult] = {}
-        for symbol in self._symbols:
+        for symbol in cycle_symbols:
             try:
                 families[symbol] = self._verified_family(catalog, symbol, started)
             except Exception as exc:  # noqa: BLE001 - one symbol must not block others
@@ -752,7 +821,7 @@ class DhanAcquisitionService:
             completed_at=completed,
             configured=True,
             master_batch_id=catalog.provenance.batch_id,
-            markets=tuple(results_by_symbol[symbol] for symbol in self._symbols),
+            markets=tuple(results_by_symbol[symbol] for symbol in cycle_symbols),
             subscriptions=self.subscriptions_snapshot(),
         )
         self._record_cycle(cycle)
@@ -1078,6 +1147,9 @@ class DhanAcquisitionService:
             health.snapshot_id = snapshot.snapshot_id
             health.accepted = accepted
             health.error_code = data_error_code
+            health.validation_issues = tuple(
+                str(issue.code) for issue in ingestion.report.issues
+            )
         best = (
             next((item for item in analysis.ranked_strikes if item.eligible), None)
             if analysis is not None
@@ -1226,9 +1298,17 @@ class DhanAcquisitionService:
                 )
             }
             self._resolved_contracts = active
+            focused = self._focused_symbol
+            subscription_entries = (
+                tuple(active.values())
+                if focused is None
+                else (active[focused],)
+                if focused in active
+                else ()
+            )
             selected_subscriptions = _unique_subscriptions(
                 item
-                for entry in active.values()
+                for entry in subscription_entries
                 for item in entry.selected.subscriptions
             )
             selected_contracts = {
@@ -1273,6 +1353,7 @@ class DhanAcquisitionService:
             health = self._market_health[symbol]
             health.last_attempt_at = now
             health.error_code = code
+            health.validation_issues = ()
         return MarketAcquisitionResult(
             symbol=symbol,
             success=False,
@@ -1285,35 +1366,59 @@ class DhanAcquisitionService:
         with self._lock:
             self._last_cycle = cycle
             self._last_cycle_completed = cycle.completed_at
+            known_healthy_markets = tuple(
+                health
+                for health in self._market_health.values()
+                if health.last_success_at is not None
+                and health.accepted
+                and health.error_code is None
+            )
+            all_configured_markets_initialized = (
+                len(known_healthy_markets) == len(self._market_health)
+            )
             if not cycle.configured:
                 self._lifecycle = AcquisitionLifecycle.CONFIG_REQUIRED
                 self._consecutive_failures += 1
             elif (
-                cycle.data_successful_markets == len(cycle.markets)
+                cycle.data_successful_markets > 0
+                and all_configured_markets_initialized
                 and self._master_error_code is None
                 and self._callback_error_code is None
             ):
                 self._lifecycle = AcquisitionLifecycle.RUNNING
                 self._consecutive_failures = 0
                 self._last_success = cycle.completed_at
-            elif cycle.data_successful_markets:
+            elif cycle.data_successful_markets > 0:
+                # A bounded worker cycle can intentionally refresh only the focused
+                # symbol plus one background symbol. That is partial universe coverage,
+                # not a provider failure.
+                self._lifecycle = AcquisitionLifecycle.PARTIAL
+                self._consecutive_failures = 0
+                self._last_success = cycle.completed_at
+            elif known_healthy_markets:
+                # One broken background symbol must not erase independently verified
+                # markets from the acquisition health surface. Freshness is evaluated
+                # by the runtime/read model; this lifecycle only reports that the
+                # provider is partially usable.
                 self._lifecycle = AcquisitionLifecycle.PARTIAL
                 self._consecutive_failures += 1
-                self._last_success = cycle.completed_at
             else:
                 self._lifecycle = AcquisitionLifecycle.ERROR
                 self._consecutive_failures += 1
             lifecycle = self._lifecycle.value
             consecutive_failures = self._consecutive_failures
+            focused_symbol = self._focused_symbol
         _LOGGER.info(
             "market_cycle %s",
             json.dumps(
                 {
                     "accepted_markets": cycle.accepted_markets,
+                    "attempted_markets": cycle.attempted_markets,
                     "completed_at": cycle.completed_at.isoformat(),
                     "configured": cycle.configured,
                     "consecutive_failures": consecutive_failures,
                     "event": "acquisition_cycle",
+                    "focused_symbol": focused_symbol,
                     "markets": [
                         {
                             "error_code": result.error_code,
@@ -1330,12 +1435,54 @@ class DhanAcquisitionService:
             ),
         )
 
+    def _worker_cycle_symbols(self) -> tuple[str, ...]:
+        """Return focused market first and one rotating background market second."""
+
+        with self._lock:
+            symbols = self._symbols
+            focused = self._focused_symbol
+            if len(symbols) == 1:
+                self._focus_refresh_pending = False
+                return symbols
+
+            if focused is not None and self._focus_refresh_pending:
+                # A newly selected market gets the next provider cycle exclusively.
+                # This prevents an unrelated uncached expiry request from delaying the
+                # first workspace publication after NIFTY -> SENSEX -> MCX switches.
+                self._focus_refresh_pending = False
+                return (focused,)
+
+            if focused is None:
+                selected = symbols[self._background_cursor % len(symbols)]
+                self._background_cursor = (
+                    self._background_cursor + 1
+                ) % len(symbols)
+                return (selected,)
+
+            background = tuple(symbol for symbol in symbols if symbol != focused)
+            if not background:
+                return (focused,)
+            selected_background = background[
+                self._background_cursor % len(background)
+            ]
+            self._background_cursor = (
+                self._background_cursor + 1
+            ) % len(background)
+            return (focused, selected_background)
+
     def _worker(self) -> None:
         while not self._stop_event.is_set():
+            # Clearing before reading focus avoids losing a focus update: a request that
+            # arrives after this point sets the event and short-circuits the next sleep.
+            self._reschedule_event.clear()
             cycle_started = monotonic()
             try:
-                cycle = self.run_once()
-                failed = cycle.data_successful_markets == 0
+                self.run_once(symbols=self._worker_cycle_symbols())
+                # Per-symbol failures are already isolated inside run_once. Do not
+                # apply exponential provider backoff merely because the current
+                # background symbol failed; continue rotating after the normal poll
+                # interval so one bad contract cannot starve every other market.
+                failed = False
             except Exception as exc:  # noqa: BLE001 - daemon supervisor remains bounded
                 failed = True
                 with self._lock:
@@ -1355,19 +1502,16 @@ class DhanAcquisitionService:
             with self._lock:
                 failures = self._consecutive_failures
             if failed:
-                # A failed provider sweep receives a real post-failure pause. This
-                # prevents a long failed request from immediately hammering Dhan again.
                 delay = min(
                     self._maximum_backoff,
                     self._poll_interval * (2 ** min(max(0, failures - 1), 6)),
                 )
             else:
-                # Successful sweeps are scheduled from their start time. With multiple
-                # symbols, endpoint rate limiting can consume the whole interval; adding
-                # another unconditional sleep would let early snapshots become stale.
                 elapsed = max(0.0, monotonic() - cycle_started)
                 delay = max(0.0, self._poll_interval - elapsed)
-            self._stop_event.wait(delay)
+
+            # Selection changes wake this wait immediately; stop() also sets the event.
+            self._reschedule_event.wait(delay)
 
     @staticmethod
     def _checked_time(value: datetime) -> datetime:

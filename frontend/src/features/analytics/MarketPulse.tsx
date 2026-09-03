@@ -10,7 +10,10 @@ interface MarketPulseProps {
 
 export function MarketPulse({ snapshot }: MarketPulseProps) {
   const { analytics } = snapshot;
-  const spot = Number(snapshot.inputs.find((item) => item.id === "spot")?.effectiveValue ?? 0);
+  // backendSnapshot spotSeries is the canonical pricing underlying: spot for
+  // index/stock contracts and the mapped futures price for MCX Black-76.
+  const underlying =
+    analytics.spotSeries.at(-1) ?? snapshot.definition.baseSpot;
   const trendTone = analytics.trend === "BULLISH" ? "positive" : analytics.trend === "BEARISH" ? "danger" : "warning";
 
   return (
@@ -24,9 +27,9 @@ export function MarketPulse({ snapshot }: MarketPulseProps) {
           <Badge tone={trendTone}>{analytics.trend}</Badge>
         </div>
         <div className="market-price-line">
-          <strong>{formatPrice(spot)}</strong>
+          <strong>{formatPrice(underlying)}</strong>
           <span className={analytics.trend === "BEARISH" ? "negative-number" : "positive-number"}>
-            {signed((analytics.spotSeries.at(-1) ?? spot) - (analytics.spotSeries[0] ?? spot))} pts
+            {signed((analytics.spotSeries.at(-1) ?? underlying) - (analytics.spotSeries[0] ?? underlying))} pts
           </span>
         </div>
         <Sparkline label={`${snapshot.selection.symbol} available price observations`} values={analytics.spotSeries} tone={analytics.trend === "BEARISH" ? "violet" : "cyan"} />

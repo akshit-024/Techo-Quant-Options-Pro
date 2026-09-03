@@ -19,6 +19,7 @@ from teco_quant.execution.errors import ExecutionError
 from teco_quant.execution.models import model_to_dict
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
+MarketFocusProvider: TypeAlias = Callable[[str, str, str | None], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,7 @@ class JsonWSGIApp:
         market_reader: MarketWorkspaceReader | None = None,
         market_leaders: MarketLeaderReader | None = None,
         feed_health: FeedHealthProvider | None = None,
+        market_focus: MarketFocusProvider | None = None,
     ) -> None:
         self.controller = controller
         self.config = config or ApiConfig()
@@ -60,6 +62,7 @@ class JsonWSGIApp:
         self.market_reader = market_reader
         self.market_leaders = market_leaders
         self.feed_health = feed_health
+        self.market_focus = market_focus
 
     def __call__(
         self, environ: Mapping[str, Any], start_response: StartResponse
@@ -173,6 +176,8 @@ class JsonWSGIApp:
         if method_name is not None:
             reader = self._require_market_reader()
             market, symbol, expiry = _market_selection(query_string)
+            if self.market_focus is not None:
+                self.market_focus(market, symbol, expiry)
             method = getattr(reader, method_name)
             value = method(market, symbol, expiry)
             if value is None:
@@ -772,6 +777,16 @@ def _safe_feed_health(reader: FeedHealthProvider | None) -> dict[str, object]:
                 and bool(re.fullmatch(r"[A-Z0-9_]{1,64}", error_code))
                 else None
             )
+            validation_issues = raw_market.get("validation_issues")
+            if isinstance(validation_issues, (list, tuple)):
+                market["validation_issues"] = [
+                    value
+                    for value in validation_issues[:64]
+                    if isinstance(value, str)
+                    and bool(re.fullmatch(r"[A-Z0-9_]{1,64}", value))
+                ]
+            else:
+                market["validation_issues"] = []
             safe_markets[raw_symbol] = market
         result["markets"] = safe_markets
     return result
