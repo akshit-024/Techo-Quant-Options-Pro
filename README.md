@@ -1,172 +1,290 @@
-# TECO Quant Options Pro
+TECO Quant Options Pro
 
-TECO Quant Pro is a local decision-support workspace for analysing Indian index, stock, and commodity options. It collects market data, validates each snapshot, calculates technical and option metrics, ranks CE and PE contracts, estimates position risk, and presents the results in a React dashboard.
+TECO Quant Options Pro is a real-time decision-support workspace for analysing Indian index, stock, and commodity options. It connects to live broker market-data services, validates incoming snapshots, calculates technical and option metrics, ranks CE and PE contracts, estimates position risk, and presents the results through a responsive React dashboard.
 
-The application is intentionally fail-closed: missing, stale, incomplete, or demo data cannot produce an actionable trade. The current release supports data analysis and deterministic paper-trading foundations; it does not place live broker orders.
+The application is intentionally fail-closed: missing, stale, incomplete, invalid, or demo data cannot produce an actionable trade. The current release is designed for market analysis, signal evaluation, and paper-trading workflows; it does not place live broker orders.
 
-## What the project does
+What the project does
 
-- Discovers supported NSE, BSE, and MCX contracts from the broker instrument master.
-- Acquires quotes, option chains, intraday candles, and live ticks when the required market-data entitlement is available.
-- Normalizes and validates coherent point-in-time market snapshots before analysis.
-- Scores CE and PE evidence independently, applies liquidity and safety gates, and ranks eligible strikes.
-- Calculates whole-lot position sizing, estimated costs, stops, and risk-multiple targets.
-- Stores local market, signal, paper-execution, and audit state in SQLite.
-- Provides a responsive dashboard with live/demo separation and explicit operational status.
+Discovers supported NSE, BSE, and MCX contracts from broker market-data sources.
 
-## Technology stack
+Acquires live quotes, option chains, intraday candles, and streaming market updates.
 
-| Layer | Technology |
-|---|---|
-| Backend | Python 3.11+, threaded WSGI server, `httpx`, `websockets` |
-| Frontend | React 19, TypeScript, Vite, CSS |
-| Persistence | SQLite |
-| Broker data | DhanHQ market-data REST APIs and WebSocket feed |
-| Backend quality | `unittest`, Ruff, mypy |
-| Frontend quality | Vitest, Testing Library, jsdom |
+Normalizes and validates market snapshots before analytics are calculated.
 
-The frontend communicates only with the local backend. Dhan credentials remain server-side and are never included in the browser bundle.
+Scores CE and PE evidence independently and ranks eligible option contracts.
 
-## Dhan API usage
+Applies liquidity, freshness, expiry, and safety checks before any decision becomes actionable.
 
-The backend uses DhanHQ read-only market-data services for instrument discovery, market quotes and depth, option-chain data, intraday OHLCV history, and streaming ticks. Live market values require an active Dhan market-data subscription in addition to valid credentials.
+Calculates whole-lot position sizing, estimated costs, stops, and risk-multiple targets.
 
-The current application does not submit live orders through Dhan Trading APIs. Without market-data access, the interface remains usable as an explicitly labelled, non-actionable demo.
+Provides clear LIVE, STALE, UNAVAILABLE, and DEMO states.
 
-## Calculations
+Keeps live and demo data strictly separated.
+
+Supports local development and cloud deployment through a backend + frontend architecture.
+
+Technology stack
+
+Layer
+
+Technology
+
+Backend
+
+Python 3.11+, httpx, websockets
+
+Frontend
+
+React 19, TypeScript, Vite, CSS
+
+Persistence
+
+SQLite
+
+Broker data
+
+DhanHQ market-data REST APIs and WebSocket feed
+
+Backend quality
+
+unittest, Ruff, mypy
+
+Frontend quality
+
+Vitest, Testing Library, jsdom
+
+Deployment
+
+Render Web Service + Render Static Site
+
+Dhan credentials remain server-side and are never included in the browser bundle.
+
+Live market-data model
+
+TECO Quant Options Pro uses the backend as the single source of truth for LIVE mode.
+
+When LIVE mode is active:
+
+the frontend requests market workspaces only from the backend;
+
+the backend connects to DhanHQ market-data services;
+
+live market snapshots are validated before being published;
+
+stale or incomplete data is shown explicitly rather than silently replaced;
+
+demo mode is available only through an explicit user choice.
+
+A live display snapshot and an actionable trade decision are intentionally treated as separate concepts. The application can display current market data while still returning WAIT, NO TRADE, or INSUFFICIENT DATA when required safety conditions are not satisfied.
+
+Dhan API usage
+
+The backend uses DhanHQ read-only market-data services for:
+
+instrument discovery;
+
+market quotes and depth;
+
+option-chain data;
+
+intraday OHLCV history;
+
+streaming market updates.
+
+Live market values require valid Dhan credentials and the required market-data entitlement.
+
+The current application does not submit live orders through Dhan Trading APIs.
+
+Calculations
 
 At a high level, TECO Quant Options Pro calculates:
 
-- Trend and momentum evidence using completed-candle VWAP, EMA/WMA, Wilder RSI and ATR, plus higher-timeframe confirmation.
-- Option values and Greeks using Black-Scholes for supported spot options and Black-76 for commodity futures options.
-- Expected move, moneyness, spread quality, volume, open interest, change in open interest, and liquidity evidence.
-- Independent call/put scores and strike rankings after freshness, expiry, liquidity, affordability, and event-risk checks.
-- Position size from account risk and premium-allocation limits, including estimated charges, stops, and 1R/2R/3R targets.
-- Replay and backtest summaries such as P&L, win rate, expectancy, drawdown, costs, and slippage.
+trend and momentum evidence from market-price data;
 
-Detailed formulas, internal score weights, and private strategy rules are intentionally not documented here.
+option values and Greeks for supported contracts;
 
-## Architecture
+expected move and moneyness;
 
-```text
-Dhan REST / WebSocket
-          |
-          v
-Broker adapters and ingestion
-          |
-          v
-Normalization and validation
-          |
-          v
-SQLite persistence
-          |
-          v
-Analytics, signals, backtesting, and paper execution
-          |
-          v
-Local Python JSON service
-          |
-          v
-React dashboard
-```
+spread and liquidity quality;
 
-```text
+volume and open-interest evidence;
+
+CE and PE contract rankings;
+
+whole-lot risk and position-sizing estimates;
+
+stop and target levels;
+
+replay and backtest summaries.
+
+Detailed strategy weights, internal decision rules, and private scoring logic are intentionally not documented publicly.
+
+Architecture
+
+Local development
+
+DhanHQ REST / WebSocket
+          |
+          v
+TECO Quant Options Pro Backend
+          |
+          v
+Validation + Analytics + Persistence
+          |
+          v
+Local JSON API
+          |
+          v
+React / Vite Frontend
+
+Deployed architecture
+
+User Browser
+     |
+     | HTTPS
+     v
+Render Static Site
+React / Vite Frontend
+     |
+     | HTTPS
+     v
+Render Web Service
+TECO Quant Options Pro Backend
+     |
+     | Server-side credentials
+     v
+DhanHQ Market Data
+
+The frontend never connects directly to DhanHQ. Broker credentials stay inside the backend environment.
+
 .
 |-- backend/
 |   |-- src/teco_quant/
-|   |   |-- analytics/
-|   |   |-- api/
-|   |   |-- automation/
-|   |   |-- backtesting/
-|   |   |-- brokers/
-|   |   |-- domain/
-|   |   |-- execution/
-|   |   |-- ingestion/
-|   |   |-- persistence/
-|   |   |-- signals/
-|   |   `-- strategy/
 |   |-- tests/
 |   |-- .env.example
 |   `-- pyproject.toml
 |-- frontend/
 |   |-- src/
-|   |   |-- api/
-|   |   |-- components/
-|   |   |-- data/
-|   |   |-- domain/
-|   |   |-- features/
-|   |   |-- hooks/
-|   |   |-- lib/
-|   |   `-- styles/
 |   |-- .env.example
 |   |-- package.json
 |   `-- vite.config.ts
+|-- render.yaml
 `-- README.md
-```
 
-## Local setup and execution
+Local setup and execution
 
 Requirements:
 
-- Python 3.11 or newer
-- Node.js 20.10 or newer
-- npm
+Python 3.11 or newer
 
-### Backend
+Node.js 20.10 or newer
+
+npm
+
+Backend
 
 Open a PowerShell terminal from the repository root:
 
-```powershell
 cd backend
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 python -m teco_quant serve
-```
 
-Add `DHAN_CLIENT_ID` and `DHAN_ACCESS_TOKEN` only to `backend/.env`. The file is ignored by Git. Set `TECO_DHAN_LIVE_ENABLED=true` only when the account has an active Dhan market-data entitlement. Other runtime and decision-profile settings are described safely by name in `backend/.env.example`.
+Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN only to backend/.env.
 
-The backend starts at `http://127.0.0.1:8000` by default.
+Set:
 
-### Frontend
+TECO_DHAN_LIVE_ENABLED=true
+TECO_EXECUTION_MODE=DATA_ONLY
+
+when live Dhan market data is configured.
+
+The backend starts at http://127.0.0.1:8000 by default.
+
+Frontend
 
 Open a second PowerShell terminal from the repository root:
 
-```powershell
 cd frontend
 Copy-Item .env.example .env
 npm ci
 npm run dev
-```
 
-Open the local URL printed by Vite, normally `http://localhost:5173`.
+Open the local URL printed by Vite, normally http://localhost:5173.
 
-## Verification
+Cloud deployment
+
+The project is prepared for deployment using Render:
+
+the backend runs as a Render Web Service;
+
+the frontend runs as a Render Static Site;
+
+broker credentials are configured only as backend environment variables;
+
+the frontend receives only the deployed backend API URL;
+
+live order execution remains disabled.
+
+For deployment, configure the backend with:
+
+DHAN_CLIENT_ID
+DHAN_ACCESS_TOKEN
+TECO_DHAN_LIVE_ENABLED=true
+TECO_EXECUTION_MODE=DATA_ONLY
+TECO_ALLOWED_ORIGINS
+
+Configure the frontend with:
+
+VITE_API_BASE_URL
+
+Never place Dhan credentials inside any VITE_* variable.
+
+Dhan access-token rotation
+
+A Dhan access-token refresh does not require a code change.
+
+When a token expires:
+
+generate a fresh Dhan access token;
+
+update DHAN_ACCESS_TOKEN in the backend deployment environment;
+
+restart or redeploy the backend service;
+
+verify that LIVE market data reconnects successfully.
+
+No Git commit is required for routine token rotation.
+
+Verification
 
 Backend:
 
-```powershell
 cd backend
 python -m unittest discover -s tests -v
 python -m ruff check src tests
 python -m mypy
-```
 
 Frontend:
 
-```powershell
 cd frontend
-npm run typecheck
 npm test
+npm run typecheck
 npm run build
-```
 
-## Security notes
+Security notes
 
-- Never commit `.env`, broker credentials, access tokens, private keys, local databases, or terminal logs.
-- Never place secrets in a `VITE_*` variable; Vite exposes those values to the browser.
-- Keep live order execution disabled until a separately reviewed broker gateway and production controls are implemented.
-- Demo data is illustrative and must not be used as a live trading signal.
+Never commit .env, broker credentials, access tokens, private keys, local databases, or terminal logs.
+
+Never place secrets in a VITE_* variable; Vite exposes those values to the browser.
+
+Keep live order execution disabled unless a separately reviewed broker gateway and production controls are implemented.
+
+Demo data is illustrative and must not be used as a live trading signal.
+
+Broker authentication failures, stale data, and incomplete snapshots must remain visible and fail closed.
 
 This software is a technical analysis and research tool, not financial advice.
