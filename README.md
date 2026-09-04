@@ -181,31 +181,64 @@ Open the local URL printed by Vite, normally `http://localhost:5173`.
 
 ## Cloud deployment
 
-The project is prepared for deployment using Render:
+The root-level `render.yaml` deploys two separate Render services:
 
-- the backend runs as a Render Web Service;
-- the frontend runs as a Render Static Site;
+- `teco-quant-backend`, a Python Web Service bound to `0.0.0.0` and Render's
+  assigned `PORT`;
+- `teco-quant-frontend`, a Vite Static Site with an SPA rewrite to
+  `index.html`.
+
+The services retain the same security boundaries as local development:
+
 - broker credentials are configured only as backend environment variables;
 - the frontend receives only the deployed backend API URL;
 - live order execution remains disabled.
 
-For deployment, configure the backend with:
+### Render setup
+
+1. Create a Render Blueprint from this repository. Render will detect
+   `render.yaml` and propose the backend and frontend services.
+2. In the backend service environment, supply:
 
 ```text
-DHAN_CLIENT_ID
-DHAN_ACCESS_TOKEN
+DHAN_CLIENT_ID=<client id>
+DHAN_ACCESS_TOKEN=<fresh access token>
 TECO_DHAN_LIVE_ENABLED=true
 TECO_EXECUTION_MODE=DATA_ONLY
-TECO_ALLOWED_ORIGINS
+TECO_ALLOWED_ORIGINS=https://<actual-frontend>.onrender.com
 ```
 
-Configure the frontend with:
+   `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN`, and `TECO_ALLOWED_ORIGINS` are marked
+   `sync: false` in the Blueprint, so their values are entered in Render and
+   are not stored in Git.
+3. In the frontend service environment, set:
 
 ```text
-VITE_API_BASE_URL
+VITE_API_BASE_URL=https://<actual-backend>.onrender.com
 ```
 
-Never place Dhan credentials inside any `VITE_*` variable.
+4. Rebuild/redeploy the frontend after changing `VITE_API_BASE_URL`; Vite
+   injects it at build time. Restart/redeploy the backend after changing its
+   credentials or allowed origins.
+5. Check `https://<actual-backend>.onrender.com/health` before opening the
+   frontend, then inspect the backend logs to confirm Dhan authentication and
+   acquisition are healthy.
+
+Use the exact HTTPS URLs assigned by Render. Never place Dhan credentials
+inside a `VITE_*` variable or in `render.yaml`.
+
+### SQLite persistence on Render
+
+The backend currently stores runtime state in SQLite. Render's default local
+service filesystem is ephemeral, so database contents may be lost across a
+restart, redeploy, or service replacement. This is acceptable only for
+non-critical runtime state in an initial portfolio deployment.
+
+Do not treat trade-journal, paper-trade, signal-history, or other SQLite data
+as durable unless the service is configured with a Render persistent disk and
+the database paths point to that disk, or the persistence layer is migrated to
+an external durable database. No external database migration is included in
+the current architecture.
 
 ## Dhan access-token rotation
 
@@ -219,6 +252,9 @@ When a token expires:
 4. verify that LIVE market data reconnects successfully.
 
 No Git commit is required for routine token rotation.
+
+An expired or invalid token should produce a visible authentication/live-data
+failure. It must not cause LIVE mode to fall back to DEMO.
 
 ## Verification
 
@@ -243,7 +279,11 @@ npm run build
 ## Security notes
 
 - Never commit `.env`, broker credentials, access tokens, private keys, local databases, or terminal logs.
+- Treat all values marked `sync: false` in `render.yaml` as deployment-time
+  configuration; enter them in the appropriate Render service.
 - Never place secrets in a `VITE_*` variable; Vite exposes those values to the browser.
+- Keep `TECO_ALLOWED_ORIGINS` restricted to the exact deployed frontend HTTPS
+  origin rather than a wildcard.
 - Keep live order execution disabled unless a separately reviewed broker gateway and production controls are implemented.
 - Demo data is illustrative and must not be used as a live trading signal.
 - Broker authentication failures, stale data, and incomplete snapshots must remain visible and fail closed.

@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Event
 
 from teco_quant.api.market_read_model import MarketReadModelStore
+from teco_quant.brokers.dhan import DhanAuthenticationError, DhanRateLimitError
 from teco_quant.domain.enums import DataSource
 from teco_quant.ingestion.dhan_acquisition import DhanAcquisitionService
 from teco_quant.ingestion.dhan_historical import completed_15m_boundary
@@ -193,6 +194,26 @@ class ProviderTimestampClient(FakeDhanClient):
             for quote in segment_data.values():
                 quote["last_trade_time"] = trade_time
         return payload
+
+
+class IntermittentProviderFailureClient(FakeDhanClient):
+    def __init__(
+        self,
+        clock: MutableClock,
+        *,
+        failures: int,
+        error: Exception,
+    ) -> None:
+        super().__init__(clock)
+        self.failures_remaining = failures
+        self.error = error
+
+    def market_quote(self, instruments_by_segment):
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            self.quote_calls += 1
+            raise self.error
+        return super().market_quote(instruments_by_segment)
 
 
 class DhanAcquisitionTests(unittest.TestCase):
@@ -527,6 +548,61 @@ class DhanAcquisitionTests(unittest.TestCase):
         health = service.health_snapshot()
         self.assertEqual(health["lifecycle_state"], "CONFIG_REQUIRED")
         self.assertNotIn("token", str(health).lower())
+
+    def test_rate_limit_backoff_is_bounded_and_resets_after_clean_acquisition(self) -> None:
+        client = IntermittentProviderFailureClient(
+            self.clock,
+            failures=5,
+            error=DhanRateLimitError("simulated provider throttle"),
+        )
+        service = DhanAcquisitionService(
+            client=client,
+            repository=self.repository,
+            ingestion_service=self.ingestion,
+            read_models=self.read_models,
+            symbols=("NIFTY",),
+            clock=self.clock,
+            poll_interval_seconds=3,
+            maximum_backoff_seconds=16,
+            rate_limit_backoff_initial_seconds=2,
+            close_client_on_stop=False,
+        )
+
+        observed_backoffs = []
+        for _ in range(5):
+            cycle = service.run_once(now=self.clock.value)
+            health = service.health_snapshot()
+            self.assertTrue(cycle.provider_rate_limited)
+            self.assertEqual(cycle.markets[0].error_code, "DHANRATELIMITERROR")
+            observed_backoffs.append(health["rate_limit_backoff_seconds"])
+            self.clock.advance(3)
+
+        self.assertEqual(observed_backoffs, [2.0, 4.0, 8.0, 16.0, 16.0])
+        self.assertEqual(service.health_snapshot()["rate_limit_failures"], 5)
+
+        recovered = service.run_once(now=self.clock.value)
+        recovered_health = service.health_snapshot()
+
+        self.assertTrue(recovered.markets[0].success)
+        self.assertFalse(recovered.provider_rate_limited)
+        self.assertEqual(recovered_health["rate_limit_failures"], 0)
+        self.assertEqual(recovered_health["rate_limit_backoff_seconds"], 0.0)
+
+    def test_authentication_failure_does_not_enter_rate_limit_backoff(self) -> None:
+        client = IntermittentProviderFailureClient(
+            self.clock,
+            failures=1,
+            error=DhanAuthenticationError("simulated invalid credentials"),
+        )
+        service = self.service(client)
+
+        cycle = service.run_once(now=self.clock.value)
+        health = service.health_snapshot()
+
+        self.assertFalse(cycle.provider_rate_limited)
+        self.assertEqual(cycle.markets[0].error_code, "DHANAUTHENTICATIONERROR")
+        self.assertEqual(health["rate_limit_failures"], 0)
+        self.assertEqual(health["rate_limit_backoff_seconds"], 0.0)
 
     def test_stop_does_not_close_client_under_a_blocked_worker(self) -> None:
         client = BlockingMasterClient(self.clock)

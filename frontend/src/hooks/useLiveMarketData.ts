@@ -255,6 +255,37 @@ async function runMarketLoop({
           revision,
         }));
       } else {
+        const selectedCatalogSymbol = catalog.markets
+          .find((market) => market.market_id === selection.market_id)
+          ?.symbols.find((item) => item.symbol === selection.symbol);
+
+        if (
+          selectedCatalogSymbol !== undefined &&
+          !selectedCatalogSymbol.expiries.includes(selection.expiry)
+        ) {
+          // The catalog conclusively identifies this market and symbol, but no
+          // longer contains the requested expiry. App owns selection and will
+          // adopt the first current expiry for this exact market/symbol. Do not
+          // issue a doomed workspace request while that reconciliation renders.
+          // If the caller does not reconcile, bounded catalog refreshes continue
+          // without repeatedly requesting the invalid expiry.
+          const replacementExpiry = selectedCatalogSymbol.expiries[0];
+          setState((current) => ({
+            ...current,
+            connection: current.workspace === null ? "LOADING" : "STALE",
+            catalog,
+            isLoading: current.workspace === null,
+            stale: current.workspace !== null,
+            error:
+              replacementExpiry === undefined
+                ? `${selection.symbol} currently has no published option expiry.`
+                : `${selection.symbol} ${selection.expiry.slice(0, 10)} is no longer available; switching to ${replacementExpiry.slice(0, 10)}.`,
+            revision,
+          }));
+          await abortableDelay(retryDelayMs, controller.signal);
+          continue;
+        }
+
         // Always ask for the selected workspace, even before it appears in /markets.
         // The backend uses this read request as an idempotent acquisition-priority hint.
         const workspace = await loadWorkspace({ ...request, selection });

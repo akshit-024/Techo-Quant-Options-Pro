@@ -20,6 +20,7 @@ from teco_quant.automation.service import TecoAutomationService
 from teco_quant.brokers.dhan import (
     DHAN_INSTRUMENT_MASTER_DETAILED,
     DhanCredentials,
+    DhanRateLimitError,
     DhanRestClient,
 )
 from teco_quant.domain.enums import (
@@ -253,6 +254,7 @@ class AcquisitionCycleResult:
     master_batch_id: str | None
     markets: tuple[MarketAcquisitionResult, ...]
     subscriptions: tuple[tuple[str, str], ...]
+    provider_rate_limited: bool = False
 
     @property
     def successful_markets(self) -> int:
@@ -290,6 +292,7 @@ class AcquisitionCycleResult:
             "accepted_markets": self.accepted_markets,
             "published_markets": self.published_markets,
             "data_successful_markets": self.data_successful_markets,
+            "provider_rate_limited": self.provider_rate_limited,
             "subscriptions": [
                 {"segment": segment, "security_id": security_id}
                 for segment, security_id in self.subscriptions
@@ -352,6 +355,7 @@ class DhanAcquisitionService:
         clock: Clock | None = None,
         poll_interval_seconds: float = 10.0,
         maximum_backoff_seconds: float = 60.0,
+        rate_limit_backoff_initial_seconds: float = 2.0,
         master_refresh_retry_seconds: float = 300.0,
         expiry_list_cache_grace_seconds: float = 36 * 60 * 60,
         history_days: int = 14,
@@ -360,10 +364,24 @@ class DhanAcquisitionService:
         source_url: str = DHAN_INSTRUMENT_MASTER_DETAILED,
         close_client_on_stop: bool = True,
     ) -> None:
-        if poll_interval_seconds < 3:
+        if (
+            isinstance(poll_interval_seconds, bool)
+            or not isfinite(float(poll_interval_seconds))
+            or poll_interval_seconds < 3
+        ):
             raise ValueError("poll interval cannot be below Dhan's three-second chain limit")
-        if maximum_backoff_seconds < poll_interval_seconds:
+        if (
+            isinstance(maximum_backoff_seconds, bool)
+            or not isfinite(float(maximum_backoff_seconds))
+            or maximum_backoff_seconds < poll_interval_seconds
+        ):
             raise ValueError("maximum backoff cannot be below the poll interval")
+        if (
+            isinstance(rate_limit_backoff_initial_seconds, bool)
+            or not isfinite(float(rate_limit_backoff_initial_seconds))
+            or rate_limit_backoff_initial_seconds <= 0
+        ):
+            raise ValueError("rate-limit backoff must be finite and positive")
         if (
             isinstance(master_refresh_retry_seconds, bool)
             or not isfinite(float(master_refresh_retry_seconds))
@@ -407,6 +425,9 @@ class DhanAcquisitionService:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._poll_interval = float(poll_interval_seconds)
         self._maximum_backoff = float(maximum_backoff_seconds)
+        self._rate_limit_backoff_initial = float(
+            rate_limit_backoff_initial_seconds
+        )
         self._master_refresh_retry = float(master_refresh_retry_seconds)
         self._expiry_list_cache_grace = float(expiry_list_cache_grace_seconds)
         self._history_days = history_days
@@ -445,6 +466,8 @@ class DhanAcquisitionService:
         self._last_cycle_completed: datetime | None = None
         self._last_success: datetime | None = None
         self._consecutive_failures = 0
+        self._rate_limit_failures = 0
+        self._rate_limit_backoff = 0.0
         self._last_cycle: AcquisitionCycleResult | None = None
         self._master_error_code: str | None = None
         self._callback_error_code: str | None = None
@@ -597,6 +620,8 @@ class DhanAcquisitionService:
                 "last_cycle_completed_at": _iso(self._last_cycle_completed),
                 "last_success_at": _iso(self._last_success),
                 "consecutive_failures": self._consecutive_failures,
+                "rate_limit_failures": self._rate_limit_failures,
+                "rate_limit_backoff_seconds": self._rate_limit_backoff,
                 "master_error_code": self._master_error_code,
                 "callback_error_code": self._callback_error_code,
                 "focused_symbol": self._focused_symbol,
@@ -663,6 +688,7 @@ class DhanAcquisitionService:
                 master_batch_id=None,
                 markets=results,
                 subscriptions=(),
+                provider_rate_limited=False,
             )
             self._record_cycle(cycle)
             return cycle
@@ -693,6 +719,10 @@ class DhanAcquisitionService:
                 master_batch_id=None,
                 markets=results,
                 subscriptions=self.subscriptions_snapshot(),
+                provider_rate_limited=isinstance(
+                    master_error,
+                    DhanRateLimitError,
+                ),
             )
             self._record_cycle(cycle)
             return cycle
@@ -823,6 +853,13 @@ class DhanAcquisitionService:
             master_batch_id=catalog.provenance.batch_id,
             markets=tuple(results_by_symbol[symbol] for symbol in cycle_symbols),
             subscriptions=self.subscriptions_snapshot(),
+            provider_rate_limited=(
+                isinstance(master_error, DhanRateLimitError)
+                or any(
+                    result.error_code == "DHANRATELIMITERROR"
+                    for result in results_by_symbol.values()
+                )
+            ),
         )
         self._record_cycle(cycle)
         return cycle
@@ -1375,6 +1412,13 @@ class DhanAcquisitionService:
         with self._lock:
             self._last_cycle = cycle
             self._last_cycle_completed = cycle.completed_at
+            if cycle.provider_rate_limited:
+                self._record_rate_limit_failure_locked()
+            elif cycle.successful_markets > 0:
+                # A clean provider cycle proves the rate-limit window recovered even
+                # when downstream validation deliberately keeps the snapshot closed.
+                self._rate_limit_failures = 0
+                self._rate_limit_backoff = 0.0
             known_healthy_markets = tuple(
                 health
                 for health in self._market_health.values()
@@ -1416,6 +1460,8 @@ class DhanAcquisitionService:
                 self._consecutive_failures += 1
             lifecycle = self._lifecycle.value
             consecutive_failures = self._consecutive_failures
+            rate_limit_failures = self._rate_limit_failures
+            rate_limit_backoff = self._rate_limit_backoff
             focused_symbol = self._focused_symbol
         _LOGGER.info(
             "market_cycle %s",
@@ -1436,12 +1482,23 @@ class DhanAcquisitionService:
                         }
                         for result in cycle.markets
                     ],
+                    "provider_rate_limited": cycle.provider_rate_limited,
                     "published_markets": cycle.published_markets,
+                    "rate_limit_backoff_seconds": rate_limit_backoff,
+                    "rate_limit_failures": rate_limit_failures,
                     "state": lifecycle,
                     "subscriptions": len(cycle.subscriptions),
                 },
                 sort_keys=True,
             ),
+        )
+
+    def _record_rate_limit_failure_locked(self) -> None:
+        self._rate_limit_failures += 1
+        exponent = min(max(0, self._rate_limit_failures - 1), 30)
+        self._rate_limit_backoff = min(
+            self._maximum_backoff,
+            self._rate_limit_backoff_initial * (2**exponent),
         )
 
     def _worker_cycle_symbols(self) -> tuple[str, ...]:
@@ -1497,6 +1554,8 @@ class DhanAcquisitionService:
                 with self._lock:
                     self._lifecycle = AcquisitionLifecycle.ERROR
                     self._consecutive_failures += 1
+                    if isinstance(exc, DhanRateLimitError):
+                        self._record_rate_limit_failure_locked()
                 _LOGGER.warning(
                     "market_cycle %s",
                     json.dumps(
@@ -1510,17 +1569,47 @@ class DhanAcquisitionService:
                 )
             with self._lock:
                 failures = self._consecutive_failures
-            if failed:
+                rate_limit_backoff = self._rate_limit_backoff
+            elapsed = max(0.0, monotonic() - cycle_started)
+            normal_delay = max(0.0, self._poll_interval - elapsed)
+            if rate_limit_backoff > 0:
+                # Add a provider cooldown to the normal cadence. It grows as
+                # 2, 4, 8, 16... seconds and is capped by maximum_backoff.
+                delay = min(
+                    self._maximum_backoff,
+                    normal_delay + rate_limit_backoff,
+                )
+            elif failed:
                 delay = min(
                     self._maximum_backoff,
                     self._poll_interval * (2 ** min(max(0, failures - 1), 6)),
                 )
             else:
-                elapsed = max(0.0, monotonic() - cycle_started)
-                delay = max(0.0, self._poll_interval - elapsed)
+                delay = normal_delay
 
-            # Selection changes wake this wait immediately; stop() also sets the event.
+            self._wait_for_next_cycle(
+                delay,
+                preserve_delay=rate_limit_backoff > 0,
+            )
+
+    def _wait_for_next_cycle(self, delay: float, *, preserve_delay: bool) -> None:
+        """Wait interruptibly, without letting selection churn bypass a 429 cooldown."""
+
+        if not preserve_delay:
+            # Selection changes wake a normal poll immediately; stop() does too.
             self._reschedule_event.wait(delay)
+            return
+
+        deadline = monotonic() + delay
+        while not self._stop_event.is_set():
+            remaining = max(0.0, deadline - monotonic())
+            if remaining == 0 or not self._reschedule_event.wait(remaining):
+                return
+            if self._stop_event.is_set():
+                return
+            # Remembered focus state remains pending. Clear only the wake signal and
+            # finish the bounded provider cooldown before issuing another REST call.
+            self._reschedule_event.clear()
 
     @staticmethod
     def _checked_time(value: datetime) -> datetime:

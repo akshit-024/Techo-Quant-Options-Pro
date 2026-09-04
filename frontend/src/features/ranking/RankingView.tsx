@@ -74,7 +74,7 @@ export function RankingView({
         <div className="page-intro__meta">
           <span>
             Universe{" "}
-            <strong>10 legs</strong>
+            <strong>{snapshot.ranking.length} legs</strong>
           </span>
 
           <span>
@@ -168,7 +168,7 @@ export function RankingView({
         {topEligible.length === 0 ? (
           <article className="top-pick-card top-pick-card--1">
             <span className="top-pick-card__rank">NO ELIGIBLE STRIKE</span>
-            <div><strong>All 10 legs are gated</strong></div>
+            <div><strong>All {snapshot.ranking.length} legs are gated</strong></div>
             <p>Review the rejection reasons in the complete ranking below.</p>
           </article>
         ) : null}

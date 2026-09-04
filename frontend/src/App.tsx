@@ -79,10 +79,14 @@ function selectionForCatalog(
     (item) => item.symbol === current.symbol,
   );
   if (selectedSymbol === undefined) return current;
-  const matchedExpiry = selectedSymbol.expiries.find(
-    (expiry) =>
-      expiry === current.expiry || expiry.slice(0, 10) === current.expiry.slice(0, 10),
-  );
+  // Prefer an exact provider value. A date-only match is used only to
+  // canonicalize an otherwise equivalent expiry (for example, when the
+  // configured value omits the provider timestamp).
+  const matchedExpiry =
+    selectedSymbol.expiries.find((expiry) => expiry === current.expiry) ??
+    selectedSymbol.expiries.find(
+      (expiry) => expiry.slice(0, 10) === current.expiry.slice(0, 10),
+    );
   return {
     market: current.market,
     symbol: selectedSymbol.symbol,

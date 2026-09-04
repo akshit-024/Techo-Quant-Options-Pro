@@ -5,6 +5,7 @@ services:
     rootDir: backend
     buildCommand: pip install -e .
     startCommand: python -m teco_quant serve --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: TECO_DHAN_LIVE_ENABLED
         value: "true"

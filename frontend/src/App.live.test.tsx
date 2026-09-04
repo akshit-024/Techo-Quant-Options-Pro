@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 
@@ -139,5 +139,70 @@ describe("live application wiring", () => {
 
     expect(screen.getByText("demo snapshot")).toBeInTheDocument();
     expect(screen.getByText("DEMO DATA")).toBeInTheDocument();
+  });
+
+  it("replaces an expired expiry only within the selected market and symbol", async () => {
+    const currentExpiry = "2099-09-12T15:30:00+05:30";
+    hookState.backend = {
+      connection: "CONNECTED",
+      payload: null,
+      lastAttemptAt: null,
+      lastSuccessAt: null,
+      error: null,
+      isLoading: false,
+      refresh: vi.fn(),
+    };
+    hookState.live = {
+      connection: "LOADING",
+      catalog: {
+        generated_at: new Date().toISOString(),
+        markets: [
+          {
+            market_id: "NIFTY",
+            symbols: [
+              {
+                symbol: "NIFTY",
+                expiries: [currentExpiry],
+                latest: {},
+              },
+            ],
+          },
+          {
+            market_id: "MCX",
+            symbols: [
+              {
+                symbol: "CRUDEOIL",
+                expiries: ["2099-09-15T23:30:00+05:30"],
+                latest: {},
+              },
+            ],
+          },
+        ],
+      },
+      workspace: null,
+      isLoading: true,
+      stale: false,
+      error: null,
+      lastSuccessAt: null,
+      revision: 2,
+      refresh: vi.fn(),
+    };
+
+    render(<App />);
+
+    expect(await screen.findByLabelText("Market")).toHaveValue("NIFTY");
+    expect(screen.getByLabelText("Symbol")).toHaveValue("NIFTY");
+    const expiry = screen.getByLabelText("Option expiry");
+    await waitFor(() => expect(expiry).toHaveValue(currentExpiry));
+    expect(
+      within(screen.getByLabelText("Symbol")).queryByRole("option", {
+        name: "CRUDEOIL",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(expiry)
+        .getAllByRole("option")
+        .map((option) => (option as HTMLOptionElement).value),
+    ).toEqual([currentExpiry]);
   });
 });

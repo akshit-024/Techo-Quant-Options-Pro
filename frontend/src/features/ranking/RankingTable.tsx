@@ -58,24 +58,10 @@ export function RankingTable({
     );
   }
 
-  /*
-   * Every ranking entry, whether LIVE or explicit DEMO,
-   * must contain a display contract name.
-   *
-   * LIVE contract names come from the backend adapter.
-   * DEMO contract names are explicitly labelled DEMO
-   * when buildDemoSnapshot() creates them.
-   */
-  const namedEntries = entries.filter(
-    (entry) =>
-      typeof entry.contractName === "string" &&
-      entry.contractName.trim().length > 0,
-  );
-
   const visibleEntries =
     limit === undefined
-      ? namedEntries
-      : namedEntries.slice(0, limit);
+      ? entries
+      : entries.slice(0, limit);
 
   /*
    * Fail closed if the selected snapshot contains no

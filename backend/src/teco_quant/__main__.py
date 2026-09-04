@@ -73,8 +73,6 @@ def serve(*, host: str | None = None, port: int | None = None) -> int:
         # Keep environment configuration loopback-only by default.
         # Deployment platforms can explicitly override the bind address at launch.
         if host is not None:
-            host = host.strip()
-
             if not host or any(character.isspace() for character in host):
                 raise ValueError(
                     "server host override must be non-blank and contain no whitespace"
@@ -86,7 +84,7 @@ def serve(*, host: str | None = None, port: int | None = None) -> int:
             )
 
         if port is not None:
-            if not 1 <= port <= 65_535:
+            if isinstance(port, bool) or not 1 <= port <= 65_535:
                 raise ValueError(
                     "server port override must be between 1 and 65535"
                 )

@@ -180,20 +180,23 @@ describe("useLiveMarketData", () => {
     expect(result.current.error).toMatch(/Dhan credentials/i);
   });
 
-  it("publishes the catalog and still attempts the requested workspace for an expired startup selection", async () => {
+  it("publishes the catalog without requesting a workspace for an expired selection", async () => {
     const fetchMock = routeFetch({
       "/status": STATUS,
       "/markets": CATALOG,
     });
     const expired: MarketSelection = { ...SELECTION, expiry: "2020-01-01" };
-    const { result } = renderHook(() =>
+    const { result, unmount } = renderHook(() =>
       useLiveMarketData(expired, {
         baseUrl: "https://backend.example",
+        retryDelayMs: 60_000,
         fetchImpl: fetchMock as typeof fetch,
       }),
     );
 
-    await waitFor(() => expect(result.current.connection).toBe("ERROR"));
+    await waitFor(() =>
+      expect(result.current.error).toMatch(/no longer available/i),
+    );
     expect(result.current.catalog?.markets[0]?.symbols[0]?.expiries).toEqual([
       SELECTION.expiry,
     ]);
@@ -201,8 +204,8 @@ describe("useLiveMarketData", () => {
     expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       "/status",
       "/markets",
-      "/market/workspace",
     ]);
+    unmount();
   });
 
   it("loads one coherent workspace, keeps it stale on refresh failure, and never overlaps", async () => {
